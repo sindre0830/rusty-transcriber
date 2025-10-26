@@ -43,7 +43,7 @@ pub fn retrieve_binary(url: &str, opts: &RetrieveBinaryOptions) -> Result<PathBu
         .filename_override
         .as_ref()
         .map(|s| s.to_string())
-        .or_else(|| url.split('/').last().map(|s| s.to_string()))
+        .or_else(|| url.split('/').next_back().map(|s| s.to_string()))
         .ok_or_else(|| anyhow!("could not infer filename from url"))?;
 
     let target_path = opts.cache_dir.join(&filename);

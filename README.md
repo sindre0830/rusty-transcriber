@@ -1,6 +1,6 @@
-# Rust Template
+# Rusty Transcriber
 
-A minimal template repository for Rust projects.
+**Rusty Transcriber** is a lightweight Rust crate for converting raw PCM audio data into text transcripts using speech-to-text models.
 
 ---
 
@@ -9,14 +9,14 @@ A minimal template repository for Rust projects.
 To include this crate in your project, add it to your dependencies:
 
 ```bash
-cargo add --git https://github.com/sindre0830/template-rust-crate.git --tag v0.1.0 template_rust_crate
+cargo add --git https://github.com/sindre0830/rusty-transcriber.git --tag v0.1.0 rusty_transcriber
 ```
 
 Or manually in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-template_rust_crate = { git = "https://github.com/sindre0830/template-rust-crate.git", tag = "v0.1.0" }
+rusty_transcriber = { git = "https://github.com/sindre0830/rusty-transcriber.git", tag = "v0.1.0" }
 ```
 
 ### Example

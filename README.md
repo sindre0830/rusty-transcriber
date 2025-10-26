@@ -9,14 +9,14 @@
 To include this crate in your project, add it to your dependencies:
 
 ```bash
-cargo add --git https://github.com/sindre0830/rusty-transcriber.git --tag v0.1.0 rusty_transcriber
+cargo add --git https://github.com/sindre0830/rusty-transcriber.git --tag v0.1.0 rusty-transcriber
 ```
 
 Or manually in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rusty_transcriber = { git = "https://github.com/sindre0830/rusty-transcriber.git", tag = "v0.1.0" }
+rusty-transcriber = { git = "https://github.com/sindre0830/rusty-transcriber.git", tag = "v0.1.0" }
 ```
 
 ### Example

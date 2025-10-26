@@ -5,7 +5,10 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+blake3 = "1.8.2"
 hex = "0.4.3"
 reqwest = { version = "0.12.24", features = ["blocking"]}
+rusty-pcm-resolver = { git = "https://github.com/sindre0830/rusty-pcm-resolver.git", tag = "v0.1.1", version = "0.1.1" }
 sha2 = "0.10.9"
 tempfile = "3.23.0"
+whisper-rs = "0.15.1"

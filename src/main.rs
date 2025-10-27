@@ -1,7 +1,7 @@
 use rusty_pcm_resolver::PcmResolver;
 use rusty_pcm_resolver::domain::MediaInput;
 
-use rusty_transcriber::{ModelInput, Options, TranscriberBuilder};
+use rusty_transcriber::{ModelInput, Options, RetrieveBinaryOptions, TranscriberBuilder};
 
 fn main() -> anyhow::Result<()> {
     let pcm_resolver_options =
@@ -12,15 +12,15 @@ fn main() -> anyhow::Result<()> {
         .load()?;
     println!("Samples: {}", samples.len());
 
-    let options = Options {
-        language: Some("en"),
-        translate_to_english: false,
-        n_threads: 6,
-        cache_dir: ".cache".into(),
-        model_fingerprint: None,
-    };
+    let model_options = RetrieveBinaryOptions::default();
+    let options = Options::new().language("en").threads(6);
     let transcript = TranscriberBuilder::new(options)
-        .load_model(ModelInput::Url("https://url.to/whisper.model.bin".into()))?
+        .load_model(
+            ModelInput::Url(
+                "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin".into(),
+            ),
+            model_options,
+        )?
         .transcribe(samples)?
         .merge_sentences();
 

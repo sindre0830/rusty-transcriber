@@ -10,17 +10,18 @@ use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, install_logging_hooks,
 };
 
-/// options for configuring a transcription
-pub struct Options<'a> {
-    pub language: Option<&'a str>,
+/// user-configurable options for transcription
+#[derive(Clone, Debug)]
+pub struct Options {
+    pub language: Option<String>,
     pub translate_to_english: bool,
     pub n_threads: i32,
     pub cache_dir: PathBuf,
     pub model_fingerprint: Option<String>,
 }
 
-impl<'a> Default for Options<'a> {
-    fn default() -> Self {
+impl Options {
+    pub fn new() -> Self {
         Self {
             language: None,
             translate_to_english: false,
@@ -28,6 +29,42 @@ impl<'a> Default for Options<'a> {
             cache_dir: PathBuf::from(".cache"),
             model_fingerprint: None,
         }
+    }
+
+    /// set the target language (e.g., "en", "no", "fr")
+    pub fn language(mut self, lang: impl Into<String>) -> Self {
+        self.language = Some(lang.into());
+        self
+    }
+
+    /// enable or disable automatic translation to English
+    pub fn translate_to_english(mut self, enable: bool) -> Self {
+        self.translate_to_english = enable;
+        self
+    }
+
+    /// set number of threads for whisper inference
+    pub fn threads(mut self, n: i32) -> Self {
+        self.n_threads = n;
+        self
+    }
+
+    /// override the directory used for transcript caching
+    pub fn cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cache_dir = dir.into();
+        self
+    }
+
+    /// manually provide a model fingerprint (optional)
+    pub fn model_fingerprint(mut self, fp: impl Into<String>) -> Self {
+        self.model_fingerprint = Some(fp.into());
+        self
+    }
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options::new()
     }
 }
 
@@ -103,27 +140,28 @@ impl Transcript {
     }
 }
 
-/// transcriber builder, handles setup of model, audio, and caching
-pub struct TranscriberBuilder<'a> {
-    options: Options<'a>,
+/// transcriber builder
+pub struct TranscriberBuilder {
+    options: Options,
     model_path: Option<PathBuf>,
 }
 
-impl<'a> TranscriberBuilder<'a> {
-    pub fn new(options: Options<'a>) -> Self {
+impl TranscriberBuilder {
+    pub fn new(options: Options) -> Self {
         Self {
             options,
             model_path: None,
         }
     }
 
-    pub fn load_model(mut self, input: ModelInput) -> Result<Self> {
+    pub fn load_model(
+        mut self,
+        input: ModelInput,
+        model_options: RetrieveBinaryOptions,
+    ) -> Result<Self> {
         let model_path = match input {
             ModelInput::Path(p) => p,
-            ModelInput::Url(u) => {
-                let opts = RetrieveBinaryOptions::default();
-                retrieve_binary(&u, &opts)?
-            }
+            ModelInput::Url(u) => retrieve_binary(&u, &model_options)?,
         };
 
         self.model_path = Some(model_path);
@@ -153,7 +191,7 @@ impl<'a> TranscriberBuilder<'a> {
         // compute stable hash for samples
         let audio_id = hash_samples(&samples);
         let opts_hash = opts_hash(
-            self.options.language,
+            self.options.language.as_deref(),
             self.options.translate_to_english,
             self.options.n_threads,
         );
@@ -171,7 +209,7 @@ impl<'a> TranscriberBuilder<'a> {
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 5 });
         params.set_n_threads(self.options.n_threads.max(1));
         params.set_translate(self.options.translate_to_english);
-        params.set_language(self.options.language);
+        params.set_language(self.options.language.as_deref());
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);
@@ -198,7 +236,8 @@ impl<'a> TranscriberBuilder<'a> {
     }
 }
 
-/// configuration for downloading and caching models
+/// configuration for downloading and caching binary files (e.g., whisper models)
+#[derive(Clone, Debug)]
 pub struct RetrieveBinaryOptions {
     pub cache_dir: PathBuf,
     pub filename_override: Option<String>,
@@ -207,8 +246,9 @@ pub struct RetrieveBinaryOptions {
     pub user_agent: Option<String>,
 }
 
-impl Default for RetrieveBinaryOptions {
-    fn default() -> Self {
+impl RetrieveBinaryOptions {
+    /// create new options with sane defaults
+    pub fn new() -> Self {
         Self {
             cache_dir: PathBuf::from(".cache"),
             filename_override: None,
@@ -216,6 +256,42 @@ impl Default for RetrieveBinaryOptions {
             timeout: Duration::from_secs(60),
             user_agent: None,
         }
+    }
+
+    /// set the directory to use for caching downloads
+    pub fn cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cache_dir = dir.into();
+        self
+    }
+
+    /// override the downloaded filename (e.g., `ggml-base.en.bin`)
+    pub fn filename_override(mut self, name: impl Into<String>) -> Self {
+        self.filename_override = Some(name.into());
+        self
+    }
+
+    /// provide an expected SHA-256 checksum for verification
+    pub fn expected_sha256(mut self, checksum: impl Into<String>) -> Self {
+        self.expected_sha256 = Some(checksum.into());
+        self
+    }
+
+    /// set timeout duration for download requests
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        self.timeout = duration;
+        self
+    }
+
+    /// set a custom HTTP User-Agent header
+    pub fn user_agent(mut self, ua: impl Into<String>) -> Self {
+        self.user_agent = Some(ua.into());
+        self
+    }
+}
+
+impl Default for RetrieveBinaryOptions {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

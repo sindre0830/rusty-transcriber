@@ -1,43 +1,31 @@
-use rusty_pcm_resolver::{MediaInput, resolve_pcm};
-use std::path::PathBuf;
+use rusty_pcm_resolver::PcmResolver;
+use rusty_pcm_resolver::domain::MediaInput;
 
-use rusty_transcriber::{
-    RetrieveBinaryOptions, merge_sentence_segments, retrieve_binary, transcribe_to_file,
-};
+use rusty_transcriber::{ModelInput, Options, TranscriberBuilder};
 
 fn main() -> anyhow::Result<()> {
-    let opts = RetrieveBinaryOptions::default();
-    let model_path = retrieve_binary(
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
-        &opts,
-    )?;
-    println!("Model ready at: {}", model_path.display());
+    let pcm_resolver_options =
+        rusty_pcm_resolver::Options::new(MediaInput::Url("https://url.to/audio".into()));
+    let samples = PcmResolver::new(pcm_resolver_options)
+        .resolve_media()?
+        .convert_to_pcm()?
+        .load()?;
+    println!("Samples: {}", samples.len());
 
-    let samples = resolve_pcm(
-        MediaInput::Url("https://5b54b4fce3488.streamlock.net/vods3/_definst_/mp4:amazons3/gowebflash/gorilla/gorilla_250814v2.mp4/playlist.m3u8".to_string()),
-        None,
-        Some(16_000),
-        Some(1),
-    )?;
-    println!("Loaded {} samples from remote URL", samples.len());
+    let options = Options {
+        language: Some("en"),
+        translate_to_english: false,
+        n_threads: 6,
+        cache_dir: ".cache".into(),
+        model_fingerprint: None,
+    };
+    let transcript = TranscriberBuilder::new(options)
+        .load_model(ModelInput::Url("https://url.to/whisper.model.bin".into()))?
+        .transcribe(samples)?
+        .merge_sentences();
 
-    let segments = transcribe_to_file(
-        &model_path,
-        &samples,
-        &PathBuf::from(".cache").join("transcripts"),
-        Some("en"),
-        false,
-        8,
-    )?;
-
-    for seg in &segments {
-        println!("[{:.2} - {:.2}] {}", seg.start_ms, seg.end_ms, seg.text);
-    }
-
-    println!();
-
-    let merged_segments = merge_sentence_segments(&segments);
-    for seg in &merged_segments {
+    println!("Segments: {}", transcript.segments.len());
+    for seg in &transcript.segments {
         println!("[{:.2} - {:.2}] {}", seg.start_ms, seg.end_ms, seg.text);
     }
 

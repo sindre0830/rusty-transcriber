@@ -138,6 +138,11 @@ impl Transcript {
 
         Self { segments: merged }
     }
+
+    /// return a list of the segment texts as owned strings
+    pub fn texts(&self) -> Vec<String> {
+        self.segments.iter().map(|s| s.text.clone()).collect()
+    }
 }
 
 /// transcriber builder

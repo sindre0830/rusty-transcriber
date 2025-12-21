@@ -1,14 +1,18 @@
 [package]
 name = "rusty-transcriber"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
 blake3 = "1.8.2"
+earshot = "0.1.0"
 hex = "0.4.3"
+parakeet-rs = { version = "0.2.6", features = ["sortformer"] }
 reqwest = { version = "0.12.24", features = ["blocking"]}
 rusty-pcm-resolver = { git = "https://github.com/sindre0830/rusty-pcm-resolver.git", tag = "v1.0.0", version = "1.0.0" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 sha2 = "0.10.9"
 tempfile = "3.23.0"
 whisper-rs = "0.15.1"

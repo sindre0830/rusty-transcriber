@@ -7,7 +7,7 @@ use crate::diarization::{Diarization, DiarizationOptions};
 use crate::io::{
     ModelInput, RetrieveBinaryOptions, retrieve_batch_files, retrieve_binary, samples_fingerprint,
 };
-use crate::stt::{PostProcessContext, Stt};
+use crate::stt::{Stt, SttOptions};
 use crate::vad::{Vad, VadOptions};
 
 mod diarization;
@@ -115,18 +115,15 @@ impl Transcript {
             Diarization::from_sortformer(samples, sample_rate, channels, diarization_model_path)?
                 .post_process(&vad.segments, &DiarizationOptions::default());
 
-        let stt = Stt::new()
-            .from_parakeet_tdt(
-                samples,
-                sample_rate,
-                channels,
-                transcriber_model_path,
-                &vad.segments,
-            )?
-            .post_process_default(PostProcessContext {
-                diarization: Some(&diarization.segments),
-                vad: Some(&vad.segments),
-            });
+        let stt = Stt::from_parakeet_tdt(
+            samples,
+            sample_rate,
+            channels,
+            transcriber_model_path,
+            &vad.segments,
+            &SttOptions::default(),
+        )?
+        .post_process(&diarization.segments, &vad.segments, &SttOptions::default());
 
         self.segments = stt
             .segments

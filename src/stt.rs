@@ -19,26 +19,43 @@ pub struct Stt {
     pub segments: Vec<SttSegment>,
 }
 
-#[derive(Clone, Copy)]
-pub struct PostProcessContext<'a> {
-    pub diarization: Option<&'a [DiarizationSegment]>,
-    pub vad: Option<&'a [VadSegment]>,
+#[derive(Debug, Clone, Copy)]
+pub struct SttOptions {
+    pub vad_window_pad_ms: i64,
+    pub vad_window_merge_gap_ms: i64,
+    pub max_window_ms: i64,
+    pub timestamp_mode: TimestampMode,
+    pub merge_sentence_fragments_gap_ms: i64,
+    pub merge_fragmented_segments_gap_ms: i64,
+    pub merge_dangling_segments_gap_ms: i64,
+    pub diar_boundary_overlap_segments: u32,
+    pub require_same_speaker_for_merges: bool,
+}
+
+impl Default for SttOptions {
+    fn default() -> Self {
+        Self {
+            vad_window_pad_ms: 120,
+            vad_window_merge_gap_ms: 250,
+            max_window_ms: 35_000,
+            timestamp_mode: TimestampMode::Sentences,
+            merge_sentence_fragments_gap_ms: 800,
+            merge_fragmented_segments_gap_ms: 600,
+            merge_dangling_segments_gap_ms: 1200,
+            diar_boundary_overlap_segments: 2,
+            require_same_speaker_for_merges: true,
+        }
+    }
 }
 
 impl Stt {
-    pub fn new() -> Self {
-        Self {
-            segments: Vec::new(),
-        }
-    }
-
     pub fn from_parakeet_tdt(
-        mut self,
         samples: &[f32],
         sample_rate: u32,
         channels: u8,
         model_path: &Path,
         vad_segments: &[VadSegment],
+        opts: &SttOptions,
     ) -> Result<Self> {
         let mut stt_model = ParakeetTDT::from_pretrained(model_path, None)
             .context("failed to load TDT STT model")?;
@@ -46,7 +63,7 @@ impl Stt {
         let total_frames = (samples.len() / channels as usize) as i64;
         let total_ms = (total_frames * 1000) / sample_rate as i64;
 
-        let windows = build_vad_windows(vad_segments, total_ms);
+        let windows = build_vad_windows(vad_segments, total_ms, opts);
 
         let mut out: Vec<SttSegment> = Vec::new();
 
@@ -63,7 +80,7 @@ impl Stt {
                     chunk.to_vec(),
                     sample_rate,
                     channels as u16,
-                    Some(TimestampMode::Sentences),
+                    Some(opts.timestamp_mode),
                 )
                 .context("TDT transcription failed")?;
 
@@ -77,16 +94,21 @@ impl Stt {
         }
 
         out.sort_by_key(|s| (s.start_ms, s.end_ms));
-        self.segments = out;
-        Ok(self)
+
+        Ok(Self { segments: out })
     }
 
-    pub fn post_process_default(self, ctx: PostProcessContext<'_>) -> Self {
+    pub fn post_process(
+        self,
+        diarization: &[DiarizationSegment],
+        vad: &[VadSegment],
+        opts: &SttOptions,
+    ) -> Self {
         self.format_numbers_and_spacing()
             .normalize_hyphenated_compounds()
-            .merge_sentence_fragments(800, ctx.diarization)
-            .merge_fragmented_segments(600, ctx.diarization)
-            .merge_dangling_segments(1200, ctx.diarization, ctx.vad)
+            .merge_sentence_fragments(opts.merge_sentence_fragments_gap_ms, diarization, opts)
+            .merge_fragmented_segments(opts.merge_fragmented_segments_gap_ms, diarization, opts)
+            .merge_dangling_segments(opts.merge_dangling_segments_gap_ms, diarization, vad, opts)
             .dedupe_stutters()
     }
 
@@ -106,37 +128,39 @@ impl Stt {
 
     /// Merge small “sentence fragments” such as:
     /// - "We're about 4.47" + "million in the quarter."
-    /// while respecting optional diarization boundaries.
+    /// while respecting diarization boundaries.
     pub fn merge_sentence_fragments(
         mut self,
         max_gap_ms: i64,
-        diarization: Option<&[DiarizationSegment]>,
+        diarization: &[DiarizationSegment],
+        opts: &SttOptions,
     ) -> Self {
-        self.segments = merge_sentence_fragments_impl(self.segments, max_gap_ms, diarization);
+        self.segments = merge_sentence_fragments_impl(self.segments, max_gap_ms, diarization, opts);
         self
     }
 
     /// Merge fragmented segments that look like a prefix-overlap duplication,
-    /// while respecting diarization speaker identity (if provided).
+    /// while respecting diarization speaker identity.
     pub fn merge_fragmented_segments(
         mut self,
         max_gap_ms: i64,
-        diarization: Option<&[DiarizationSegment]>,
+        diarization: &[DiarizationSegment],
+        opts: &SttOptions,
     ) -> Self {
-        merge_fragmented_segments_impl(&mut self.segments, max_gap_ms, diarization);
+        merge_fragmented_segments_impl(&mut self.segments, max_gap_ms, diarization, opts);
         self
     }
 
     /// Merge “dangling” short follow-ups and weak terminals, while respecting diarization
-    /// speaker identity (if provided). `vad` is accepted for future tightening, but
-    /// current heuristics don't require it.
+    /// speaker identity.
     pub fn merge_dangling_segments(
         mut self,
         max_gap_ms: i64,
-        diarization: Option<&[DiarizationSegment]>,
-        _vad: Option<&[VadSegment]>,
+        diarization: &[DiarizationSegment],
+        _vad: &[VadSegment],
+        opts: &SttOptions,
     ) -> Self {
-        merge_dangling_segments_impl(&mut self.segments, max_gap_ms, diarization);
+        merge_dangling_segments_impl(&mut self.segments, max_gap_ms, diarization, opts);
         self
     }
 
@@ -154,17 +178,17 @@ struct VadWindow {
     end_ms: i64,
 }
 
-fn build_vad_windows(vad_segments: &[VadSegment], total_ms: i64) -> Vec<VadWindow> {
-    let pad_ms: i64 = 120;
-    let merge_gap_ms: i64 = 250;
-    let max_window_ms: i64 = 35_000;
-
+fn build_vad_windows(
+    vad_segments: &[VadSegment],
+    total_ms: i64,
+    opts: &SttOptions,
+) -> Vec<VadWindow> {
     let mut segs: Vec<VadWindow> = vad_segments
         .iter()
         .copied()
         .map(|s| VadWindow {
-            start_ms: (s.start_ms - pad_ms).max(0),
-            end_ms: (s.end_ms + pad_ms).min(total_ms),
+            start_ms: (s.start_ms - opts.vad_window_pad_ms).max(0),
+            end_ms: (s.end_ms + opts.vad_window_pad_ms).min(total_ms),
         })
         .filter(|s| s.end_ms > s.start_ms)
         .collect();
@@ -175,7 +199,7 @@ fn build_vad_windows(vad_segments: &[VadSegment], total_ms: i64) -> Vec<VadWindo
     for s in segs {
         if let Some(last) = merged.last_mut() {
             let gap = s.start_ms - last.end_ms;
-            if gap <= merge_gap_ms {
+            if gap <= opts.vad_window_merge_gap_ms {
                 last.end_ms = last.end_ms.max(s.end_ms);
                 continue;
             }
@@ -187,7 +211,7 @@ fn build_vad_windows(vad_segments: &[VadSegment], total_ms: i64) -> Vec<VadWindo
     for s in merged {
         let mut cur_start = s.start_ms;
         while cur_start < s.end_ms {
-            let cur_end = (cur_start + max_window_ms).min(s.end_ms);
+            let cur_end = (cur_start + opts.max_window_ms).min(s.end_ms);
             out.push(VadWindow {
                 start_ms: cur_start,
                 end_ms: cur_end,
@@ -228,7 +252,8 @@ fn slice_by_ms<'a>(
 fn merge_sentence_fragments_impl(
     mut segments: Vec<SttSegment>,
     max_gap_ms: i64,
-    diarization: Option<&[DiarizationSegment]>,
+    diarization: &[DiarizationSegment],
+    opts: &SttOptions,
 ) -> Vec<SttSegment> {
     if segments.len() < 2 {
         return segments;
@@ -243,7 +268,7 @@ fn merge_sentence_fragments_impl(
 
             if gap <= max_gap_ms
                 && should_merge_text(&last.text, &seg.text)
-                && !crosses_speaker_boundary(last.end_ms, seg.start_ms, diarization)
+                && !crosses_speaker_boundary(last.end_ms, seg.start_ms, diarization, opts)
             {
                 last.end_ms = last.end_ms.max(seg.end_ms);
                 last.text = join_text(&last.text, &seg.text);
@@ -258,30 +283,24 @@ fn merge_sentence_fragments_impl(
 }
 
 /// Returns true if there is a diarization boundary between [a_ms, b_ms].
-/// We don't assign speakers; we just avoid merging across a change.
 fn crosses_speaker_boundary(
     a_ms: i64,
     b_ms: i64,
-    diarization: Option<&[DiarizationSegment]>,
+    diarization: &[DiarizationSegment],
+    opts: &SttOptions,
 ) -> bool {
-    let Some(d) = diarization else {
-        return false;
-    };
-
-    if d.is_empty() {
+    if diarization.is_empty() {
         return false;
     }
 
     let lo = a_ms.min(b_ms);
     let hi = a_ms.max(b_ms);
 
-    // a speaker change implies the end of one segment and start of another within the interval.
-    // robust check: if the interval overlaps 2+ diar segments, treat as boundary-crossing.
     let mut overlaps = 0u32;
-    for s in d {
+    for s in diarization {
         if ranges_overlap(lo, hi, s.start_ms, s.end_ms) {
             overlaps += 1;
-            if overlaps >= 2 {
+            if overlaps >= opts.diar_boundary_overlap_segments {
                 return true;
             }
         }
@@ -306,7 +325,6 @@ fn should_merge_text(prev: &str, next: &str) -> bool {
 
     let next_first = next.chars().next().unwrap_or('\0');
 
-    // continuation heuristics
     if next_first.is_ascii_lowercase() || next_first.is_ascii_digit() {
         return true;
     }
@@ -420,16 +438,11 @@ fn format_numbers_and_spacing_text(input: &str) -> String {
     while i < chars.len() {
         let c = chars[i];
 
-        // helper: last non-space character we emitted
         let last_non_space = out.chars().rev().find(|ch| !ch.is_whitespace());
 
-        // insert space between alpha<->digit, except for common glued patterns (Q1, H1, 2nd, 1st, etc)
         if let Some(prev) = last_non_space {
             if prev.is_ascii_alphabetic() && c.is_ascii_digit() {
                 let prev_upper = prev.to_ascii_uppercase();
-
-                // only single-letter glue prefixes here
-                // FY/CY are handled by is_prev_token_glued_prefix (token-based)
                 let glue = matches!(prev_upper, 'Q' | 'H') || is_prev_token_glued_prefix(&out);
 
                 if !glue && !out.ends_with(' ') {
@@ -444,7 +457,6 @@ fn format_numbers_and_spacing_text(input: &str) -> String {
             }
         }
 
-        // fix "digit space dot digit" -> "digit.dotdigit"  (e.g. "1 .47")
         if c.is_ascii_digit()
             && i + 3 < chars.len()
             && chars[i + 1].is_whitespace()
@@ -457,7 +469,6 @@ fn format_numbers_and_spacing_text(input: &str) -> String {
             continue;
         }
 
-        // fix "digit space dot space digit" -> "digit.dotdigit" (e.g. "5 . 16")
         if c.is_ascii_digit()
             && i + 4 < chars.len()
             && chars[i + 1].is_whitespace()
@@ -471,13 +482,11 @@ fn format_numbers_and_spacing_text(input: &str) -> String {
             continue;
         }
 
-        // remove space before percent: "600 %" -> "600%"
         if c.is_whitespace() && i + 1 < chars.len() && chars[i + 1] == '%' {
             i += 1;
             continue;
         }
 
-        // collapse whitespace
         if c.is_whitespace() {
             if !out.ends_with(' ') {
                 out.push(' ');
@@ -493,7 +502,6 @@ fn format_numbers_and_spacing_text(input: &str) -> String {
     out.trim().to_string()
 }
 
-/// optional hook: keep patterns like "Q1" already formed, so you can build "Q12025" without spaces
 fn is_prev_token_glued_number_prefix(out: &str) -> bool {
     let token = last_ascii_word(out);
     if token.len() != 2 {
@@ -507,8 +515,6 @@ fn is_prev_token_glued_number_prefix(out: &str) -> bool {
     matches!(first, 'Q' | 'H') && second.is_ascii_digit()
 }
 
-/// returns true if the upcoming letters at `idx` look like an ordinal suffix: st/nd/rd/th
-/// idx is the index of the first suffix character (current char) in the original input.
 fn looks_like_ordinal_suffix(chars: &[char], idx: usize) -> bool {
     if idx >= chars.len() {
         return false;
@@ -524,13 +530,11 @@ fn looks_like_ordinal_suffix(chars: &[char], idx: usize) -> bool {
     matches!((c0, c1), ('s', 't') | ('n', 'd') | ('r', 'd') | ('t', 'h'))
 }
 
-/// optional hook: keep prefixes like "FY" or "CY" glued to numbers (FY25, CY2025)
 fn is_prev_token_glued_prefix(out: &str) -> bool {
     let token = last_ascii_word(out);
     matches!(token.as_str(), "FY" | "CY")
 }
 
-/// gets the last contiguous [A-Za-z0-9] token from `out` (already emitted text)
 fn last_ascii_word(out: &str) -> String {
     let mut token: Vec<char> = Vec::new();
 
@@ -555,10 +559,8 @@ fn normalize_hyphenated_compounds_text(input: &str) -> String {
         let c = chars[i];
 
         if c == '-' {
-            // find previous emitted non-space
             let prev = out.chars().rev().find(|ch| !ch.is_whitespace());
 
-            // find next non-space in input
             let mut j = i + 1;
             while j < chars.len() && chars[j].is_whitespace() {
                 j += 1;
@@ -571,8 +573,6 @@ fn normalize_hyphenated_compounds_text(input: &str) -> String {
 
             let should_join = match (prev, next) {
                 (Some(p), Some(n)) => {
-                    // join if both sides are alnum and at least one side is a letter
-                    // (avoids changing "10 - 20" into "10-20")
                     p.is_ascii_alphanumeric()
                         && n.is_ascii_alphanumeric()
                         && (p.is_ascii_alphabetic() || n.is_ascii_alphabetic())
@@ -581,14 +581,11 @@ fn normalize_hyphenated_compounds_text(input: &str) -> String {
             };
 
             if should_join {
-                // remove trailing spaces before '-'
                 while out.ends_with(' ') {
                     out.pop();
                 }
 
                 out.push('-');
-
-                // skip spaces after '-' (we already emitted the hyphen)
                 i = j;
                 continue;
             }
@@ -606,22 +603,24 @@ fn normalize_hyphenated_compounds_text(input: &str) -> String {
 // ------------------------------
 
 fn same_diarization_speaker(
-    diarization: Option<&[DiarizationSegment]>,
+    diarization: &[DiarizationSegment],
     a0: i64,
     a1: i64,
     b0: i64,
     b1: i64,
+    opts: &SttOptions,
 ) -> bool {
-    let Some(d) = diarization else {
-        return false;
-    };
-
-    if d.is_empty() {
-        return false;
+    if diarization.is_empty() {
+        // no boundary info; allow merge
+        return true;
     }
 
-    let sa = diarization_speaker_for_window(d, a0, a1);
-    let sb = diarization_speaker_for_window(d, b0, b1);
+    if !opts.require_same_speaker_for_merges {
+        return true;
+    }
+
+    let sa = diarization_speaker_for_window(diarization, a0, a1);
+    let sb = diarization_speaker_for_window(diarization, b0, b1);
 
     matches!((sa, sb), (Some(x), Some(y)) if x == y)
 }
@@ -661,7 +660,8 @@ fn overlap_ms(a0: i64, a1: i64, b0: i64, b1: i64) -> i64 {
 fn merge_fragmented_segments_impl(
     segments: &mut Vec<SttSegment>,
     max_gap_ms: i64,
-    diarization: Option<&[DiarizationSegment]>,
+    diarization: &[DiarizationSegment],
+    opts: &SttOptions,
 ) {
     if segments.len() < 2 {
         return;
@@ -672,7 +672,14 @@ fn merge_fragmented_segments_impl(
         let a = segments[i].clone();
         let b = segments[i + 1].clone();
 
-        if !same_diarization_speaker(diarization, a.start_ms, a.end_ms, b.start_ms, b.end_ms) {
+        if !same_diarization_speaker(
+            diarization,
+            a.start_ms,
+            a.end_ms,
+            b.start_ms,
+            b.end_ms,
+            opts,
+        ) {
             i += 1;
             continue;
         }
@@ -797,7 +804,8 @@ fn normalize_for_match(input: &str) -> String {
 fn merge_dangling_segments_impl(
     segments: &mut Vec<SttSegment>,
     max_gap_ms: i64,
-    diarization: Option<&[DiarizationSegment]>,
+    diarization: &[DiarizationSegment],
+    opts: &SttOptions,
 ) {
     if segments.len() < 2 {
         return;
@@ -808,7 +816,14 @@ fn merge_dangling_segments_impl(
         let a = segments[i].clone();
         let b = segments[i + 1].clone();
 
-        if !same_diarization_speaker(diarization, a.start_ms, a.end_ms, b.start_ms, b.end_ms) {
+        if !same_diarization_speaker(
+            diarization,
+            a.start_ms,
+            a.end_ms,
+            b.start_ms,
+            b.end_ms,
+            opts,
+        ) {
             i += 1;
             continue;
         }
@@ -854,8 +869,6 @@ fn merge_dangling_segments_impl(
 }
 
 fn ends_with_bad_terminal(text: &str) -> bool {
-    // merges things like "... talking about." + "AI a lot."
-    // only triggers if the segment ends with '.' and the last word is a weak terminal.
     if !text.ends_with('.') {
         return false;
     }
@@ -875,8 +888,6 @@ fn ends_with_bad_terminal(text: &str) -> bool {
 }
 
 fn is_short_tail(text: &str) -> bool {
-    // merges very short follow-ups (often chunk boundary split),
-    // like "AI a lot." or "System." or "More importantly,"
     let cleaned = text
         .trim_matches(|c: char| c.is_whitespace() || c == ',' || c == '.' || c == '!' || c == '?')
         .trim();
@@ -890,7 +901,6 @@ fn is_short_tail(text: &str) -> bool {
 }
 
 fn join_sentences(a: &str, b: &str) -> String {
-    // joins with sensible punctuation/spaces, avoids ".,"
     let a = a.trim_end();
     let b = b.trim_start();
 
@@ -924,20 +934,16 @@ fn dedupe_stutters_text(input: &str) -> String {
         return input.trim().to_string();
     }
 
-    // remove immediate duplicate tokens: "the the" -> "the"
     tokens = remove_adjacent_duplicates(tokens);
 
-    // fix "y yes" -> "yes"
     if tokens.len() >= 2 && is_single_letter(&tokens[0]) && eq_loose(&tokens[1], "yes") {
         tokens.remove(0);
     }
 
-    // fix "we've we're" -> keep second
     tokens = drop_known_pair(tokens, "we've", "we're");
     remove_adjacent_pair(&mut tokens, "not", "no", true);
     remove_adjacent_pair(&mut tokens, "we've", "we're", true);
 
-    // fix "not no X" -> "no X" (conservative, only for immediate "not no")
     if tokens.len() >= 2 && eq_loose(&tokens[0], "not") && eq_loose(&tokens[1], "no") {
         tokens.remove(0);
     }
@@ -977,7 +983,6 @@ fn drop_known_pair(tokens: Vec<String>, a: &str, b: &str) -> Vec<String> {
 
     while i < tokens.len() {
         if i + 1 < tokens.len() && eq_loose(&tokens[i], a) && eq_loose(&tokens[i + 1], b) {
-            // drop the first token, keep the second
             out.push(tokens[i + 1].clone());
             i += 2;
             continue;

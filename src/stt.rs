@@ -1535,9 +1535,7 @@ fn segment_speaker_id(
         return None;
     }
 
-    let Some(mut dom) = dominant_speaker(diarization, seg.start_ms, seg.end_ms) else {
-        return None;
-    };
+    let mut dom = dominant_speaker(diarization, seg.start_ms, seg.end_ms)?;
 
     dom.is_confident = dom.overlap_ms >= opts.speaker_min_overlap_ms
         || dom.ratio >= opts.speaker_min_overlap_ratio;

@@ -25,11 +25,24 @@ pub struct SttOptions {
     pub vad_window_merge_gap_ms: i64,
     pub max_window_ms: i64,
     pub timestamp_mode: TimestampMode,
+
     pub merge_sentence_fragments_gap_ms: i64,
     pub merge_fragmented_segments_gap_ms: i64,
     pub merge_dangling_segments_gap_ms: i64,
+
     pub diar_boundary_overlap_segments: u32,
+    pub diar_boundary_min_overlap_ms: i64,
+
     pub require_same_speaker_for_merges: bool,
+    pub speaker_min_overlap_ms: i64,
+    pub speaker_min_overlap_ratio: f32,
+
+    pub enable_finance_normalization: bool,
+    pub enable_discourse_cleanup: bool,
+    pub phrase_dedupe_max_ngram: usize,
+
+    pub remove_fillers: bool,
+    pub filler_max_len: usize,
 }
 
 impl Default for SttOptions {
@@ -39,11 +52,24 @@ impl Default for SttOptions {
             vad_window_merge_gap_ms: 250,
             max_window_ms: 35_000,
             timestamp_mode: TimestampMode::Sentences,
+
             merge_sentence_fragments_gap_ms: 800,
             merge_fragmented_segments_gap_ms: 600,
             merge_dangling_segments_gap_ms: 1200,
+
             diar_boundary_overlap_segments: 2,
+            diar_boundary_min_overlap_ms: 200,
+
             require_same_speaker_for_merges: true,
+            speaker_min_overlap_ms: 300,
+            speaker_min_overlap_ratio: 0.35,
+
+            enable_finance_normalization: true,
+            enable_discourse_cleanup: true,
+            phrase_dedupe_max_ngram: 4,
+
+            remove_fillers: true,
+            filler_max_len: 4,
         }
     }
 }
@@ -104,12 +130,30 @@ impl Stt {
         vad: &[VadSegment],
         opts: &SttOptions,
     ) -> Self {
-        self.format_numbers_and_spacing()
-            .normalize_hyphenated_compounds()
+        let mut out = self
+            .format_numbers_and_spacing()
+            .normalize_hyphenated_compounds();
+
+        if opts.enable_finance_normalization {
+            out = out.normalize_finance_terms();
+        }
+
+        out = out
             .merge_sentence_fragments(opts.merge_sentence_fragments_gap_ms, diarization, opts)
             .merge_fragmented_segments(opts.merge_fragmented_segments_gap_ms, diarization, opts)
             .merge_dangling_segments(opts.merge_dangling_segments_gap_ms, diarization, vad, opts)
-            .dedupe_stutters()
+            .dedupe_stutters_with_options(opts);
+
+        if opts.remove_fillers {
+            out = out.remove_fillers(opts);
+        }
+
+        if opts.enable_discourse_cleanup {
+            out = out.cleanup_discourse_collisions();
+        }
+
+        out.normalize_punctuation_spacing()
+            .finalize_sentence_casing()
     }
 
     pub fn format_numbers_and_spacing(mut self) -> Self {
@@ -126,9 +170,13 @@ impl Stt {
         self
     }
 
-    /// Merge small “sentence fragments” such as:
-    /// - "We're about 4.47" + "million in the quarter."
-    /// while respecting diarization boundaries.
+    pub fn normalize_finance_terms(mut self) -> Self {
+        for seg in &mut self.segments {
+            seg.text = normalize_finance_terms_text(&seg.text);
+        }
+        self
+    }
+
     pub fn merge_sentence_fragments(
         mut self,
         max_gap_ms: i64,
@@ -139,8 +187,6 @@ impl Stt {
         self
     }
 
-    /// Merge fragmented segments that look like a prefix-overlap duplication,
-    /// while respecting diarization speaker identity.
     pub fn merge_fragmented_segments(
         mut self,
         max_gap_ms: i64,
@@ -151,8 +197,6 @@ impl Stt {
         self
     }
 
-    /// Merge “dangling” short follow-ups and weak terminals, while respecting diarization
-    /// speaker identity.
     pub fn merge_dangling_segments(
         mut self,
         max_gap_ms: i64,
@@ -164,9 +208,37 @@ impl Stt {
         self
     }
 
-    pub fn dedupe_stutters(mut self) -> Self {
+    pub fn dedupe_stutters_with_options(mut self, opts: &SttOptions) -> Self {
         for seg in &mut self.segments {
-            seg.text = dedupe_stutters_text(&seg.text);
+            seg.text = dedupe_stutters_text(&seg.text, opts.phrase_dedupe_max_ngram);
+        }
+        self
+    }
+
+    pub fn cleanup_discourse_collisions(mut self) -> Self {
+        for seg in &mut self.segments {
+            seg.text = cleanup_discourse_collisions_text(&seg.text);
+        }
+        self
+    }
+
+    pub fn normalize_punctuation_spacing(mut self) -> Self {
+        for seg in &mut self.segments {
+            seg.text = normalize_punctuation_spacing_text(&seg.text);
+        }
+        self
+    }
+
+    pub fn remove_fillers(mut self, opts: &SttOptions) -> Self {
+        for seg in &mut self.segments {
+            seg.text = remove_fillers_text(&seg.text, opts.filler_max_len);
+        }
+        self
+    }
+
+    pub fn finalize_sentence_casing(mut self) -> Self {
+        for seg in &mut self.segments {
+            seg.text = finalize_sentence_casing_text(&seg.text);
         }
         self
     }
@@ -266,8 +338,10 @@ fn merge_sentence_fragments_impl(
         if let Some(last) = out.last_mut() {
             let gap = seg.start_ms - last.end_ms;
 
-            if gap <= max_gap_ms
-                && should_merge_text(&last.text, &seg.text)
+            let strong_merge =
+                gap <= (max_gap_ms / 2).max(150) && is_strong_continuation(&last.text, &seg.text);
+
+            if (gap <= max_gap_ms && should_merge_text(&last.text, &seg.text) || strong_merge)
                 && !crosses_speaker_boundary(last.end_ms, seg.start_ms, diarization, opts)
             {
                 last.end_ms = last.end_ms.max(seg.end_ms);
@@ -282,7 +356,26 @@ fn merge_sentence_fragments_impl(
     out
 }
 
-/// Returns true if there is a diarization boundary between [a_ms, b_ms].
+fn is_strong_continuation(prev: &str, next: &str) -> bool {
+    let prev = prev.trim();
+    let next = next.trim();
+
+    if prev.is_empty() || next.is_empty() {
+        return true;
+    }
+
+    let next_first = next.chars().next().unwrap_or('\0');
+    if next_first.is_ascii_lowercase() || next_first.is_ascii_digit() {
+        return true;
+    }
+
+    let next_word = first_ascii_word(next).to_ascii_lowercase();
+    matches!(
+        next_word.as_str(),
+        "million" | "billion" | "trillion" | "percent" | "dollars" | "usd" | "eur"
+    )
+}
+
 fn crosses_speaker_boundary(
     a_ms: i64,
     b_ms: i64,
@@ -298,7 +391,8 @@ fn crosses_speaker_boundary(
 
     let mut overlaps = 0u32;
     for s in diarization {
-        if ranges_overlap(lo, hi, s.start_ms, s.end_ms) {
+        let ov = overlap_ms(lo, hi, s.start_ms, s.end_ms);
+        if ov >= opts.diar_boundary_min_overlap_ms {
             overlaps += 1;
             if overlaps >= opts.diar_boundary_overlap_segments {
                 return true;
@@ -307,12 +401,6 @@ fn crosses_speaker_boundary(
     }
 
     false
-}
-
-fn ranges_overlap(a0: i64, a1: i64, b0: i64, b1: i64) -> bool {
-    let (a0, a1) = if a0 <= a1 { (a0, a1) } else { (a1, a0) };
-    let (b0, b1) = if b0 <= b1 { (b0, b1) } else { (b1, b0) };
-    a0 < b1 && b0 < a1
 }
 
 fn should_merge_text(prev: &str, next: &str) -> bool {
@@ -434,29 +522,35 @@ fn format_numbers_and_spacing_text(input: &str) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len() + 8);
 
+    let mut prev_emitted: Option<char> = None;
+    let mut prev_non_space: Option<char> = None;
+
     let mut i = 0usize;
     while i < chars.len() {
         let c = chars[i];
 
-        let last_non_space = out.chars().rev().find(|ch| !ch.is_whitespace());
-
-        if let Some(prev) = last_non_space {
+        // insert space between alpha<->digit when appropriate
+        if let Some(prev) = prev_non_space {
             if prev.is_ascii_alphabetic() && c.is_ascii_digit() {
                 let prev_upper = prev.to_ascii_uppercase();
                 let glue = matches!(prev_upper, 'Q' | 'H') || is_prev_token_glued_prefix(&out);
 
                 if !glue && !out.ends_with(' ') {
                     out.push(' ');
+                    prev_emitted = Some(' ');
                 }
             } else if prev.is_ascii_digit() && c.is_ascii_alphabetic() {
                 let glue =
                     looks_like_ordinal_suffix(&chars, i) || is_prev_token_glued_number_prefix(&out);
+
                 if !glue && !out.ends_with(' ') {
                     out.push(' ');
+                    prev_emitted = Some(' ');
                 }
             }
         }
 
+        // "4 .47" -> "4.47"
         if c.is_ascii_digit()
             && i + 3 < chars.len()
             && chars[i + 1].is_whitespace()
@@ -465,10 +559,13 @@ fn format_numbers_and_spacing_text(input: &str) -> String {
         {
             out.push(c);
             out.push('.');
+            prev_emitted = Some('.');
+            prev_non_space = Some('.');
             i += 3;
             continue;
         }
 
+        // "4 . 47" -> "4.47"
         if c.is_ascii_digit()
             && i + 4 < chars.len()
             && chars[i + 1].is_whitespace()
@@ -478,24 +575,48 @@ fn format_numbers_and_spacing_text(input: &str) -> String {
         {
             out.push(c);
             out.push('.');
+            prev_emitted = Some('.');
+            prev_non_space = Some('.');
             i += 4;
             continue;
         }
 
+        // "4. 47" -> "4.47"
+        if c.is_ascii_digit() && i + 2 < chars.len() && chars[i + 1] == '.' {
+            let mut j = i + 2;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+
+            if j < chars.len() && chars[j].is_ascii_digit() {
+                out.push(c);
+                out.push('.');
+                prev_emitted = Some('.');
+                prev_non_space = Some('.');
+                i = j;
+                continue;
+            }
+        }
+
+        // remove space before percent: "600 %" -> "600%"
         if c.is_whitespace() && i + 1 < chars.len() && chars[i + 1] == '%' {
             i += 1;
             continue;
         }
 
+        // collapse whitespace
         if c.is_whitespace() {
-            if !out.ends_with(' ') {
+            if !matches!(prev_emitted, Some(' ')) {
                 out.push(' ');
+                prev_emitted = Some(' ');
             }
             i += 1;
             continue;
         }
 
         out.push(c);
+        prev_emitted = Some(c);
+        prev_non_space = Some(c);
         i += 1;
     }
 
@@ -598,40 +719,132 @@ fn normalize_hyphenated_compounds_text(input: &str) -> String {
     out
 }
 
+fn normalize_finance_terms_text(input: &str) -> String {
+    // simple, conservative normalizations (no external deps)
+    let mut s = input.to_string();
+
+    // normalize Q12025 -> Q1 2025 and H12025 -> H1 2025
+    s = normalize_quarter_half_year_tokens(&s);
+
+    // normalize common EBITDA variants when they appear as a token-ish word
+    s = replace_token_case_insensitive(&s, "epita", "EBITDA");
+    s = replace_token_case_insensitive(&s, "ebita", "EBITDA");
+
+    // normalize EPS tokenization
+    s = replace_token_case_insensitive(&s, "e p s", "EPS");
+    s = replace_token_case_insensitive(&s, "e. p. s.", "EPS");
+
+    // remove stray single-letter 'f' before numbers: "a f 5.16" -> "a 5.16"
+    s = drop_stray_f_before_number(&s);
+
+    s
+}
+
+fn normalize_quarter_half_year_tokens(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+
+        if (c == 'Q' || c == 'q' || c == 'H' || c == 'h')
+            && i + 5 < chars.len()
+            && chars[i + 1].is_ascii_digit()
+            && chars[i + 2].is_ascii_digit()
+            && chars[i + 3].is_ascii_digit()
+            && chars[i + 4].is_ascii_digit()
+            && chars[i + 5].is_ascii_digit()
+        {
+            out.push(c.to_ascii_uppercase());
+            out.push(chars[i + 1]);
+            out.push(' ');
+            out.push(chars[i + 2]);
+            out.push(chars[i + 3]);
+            out.push(chars[i + 4]);
+            out.push(chars[i + 5]);
+            i += 6;
+            continue;
+        }
+
+        out.push(c);
+        i += 1;
+    }
+
+    out
+}
+
+fn replace_token_case_insensitive(input: &str, needle: &str, replacement: &str) -> String {
+    let needle = needle.to_ascii_lowercase();
+
+    let mut out: Vec<String> = Vec::new();
+    for t in input.split_whitespace() {
+        let norm = normalize_token(t);
+        if norm == needle {
+            out.push(replacement.to_string());
+        } else {
+            out.push(t.to_string());
+        }
+    }
+
+    out.join(" ")
+}
+
+fn drop_stray_f_before_number(input: &str) -> String {
+    let tokens: Vec<&str> = input.split_whitespace().collect();
+    if tokens.len() < 3 {
+        return input.to_string();
+    }
+
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut i = 0usize;
+
+    while i < tokens.len() {
+        let t = tokens[i];
+
+        if i + 1 < tokens.len() && normalize_token(t) == "f" && starts_with_number(tokens[i + 1]) {
+            i += 1;
+            continue;
+        }
+
+        out.push(t.to_string());
+        i += 1;
+    }
+
+    out.join(" ")
+}
+
+fn starts_with_number(s: &str) -> bool {
+    s.chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+}
+
 // ------------------------------
 // diarization-aware merge gates
 // ------------------------------
 
-fn same_diarization_speaker(
-    diarization: &[DiarizationSegment],
-    a0: i64,
-    a1: i64,
-    b0: i64,
-    b1: i64,
-    opts: &SttOptions,
-) -> bool {
-    if diarization.is_empty() {
-        // no boundary info; allow merge
-        return true;
-    }
-
-    if !opts.require_same_speaker_for_merges {
-        return true;
-    }
-
-    let sa = diarization_speaker_for_window(diarization, a0, a1);
-    let sb = diarization_speaker_for_window(diarization, b0, b1);
-
-    matches!((sa, sb), (Some(x), Some(y)) if x == y)
+#[derive(Debug, Clone, Copy)]
+struct DominantSpeaker {
+    speaker_id: usize,
+    overlap_ms: i64,
+    ratio: f32,
+    is_confident: bool,
 }
 
-fn diarization_speaker_for_window(
+fn dominant_speaker(
     diar: &[DiarizationSegment],
     start_ms: i64,
     end_ms: i64,
-) -> Option<usize> {
-    let mut best: Option<(usize, i64)> = None;
+) -> Option<DominantSpeaker> {
+    if start_ms >= end_ms {
+        return None;
+    }
 
+    let dur = (end_ms - start_ms).max(1) as f32;
+
+    let mut best: Option<(usize, i64)> = None;
     for s in diar {
         let ov = overlap_ms(start_ms, end_ms, s.start_ms, s.end_ms);
         if ov <= 0 {
@@ -644,7 +857,12 @@ fn diarization_speaker_for_window(
         }
     }
 
-    best.map(|b| b.0)
+    best.map(|(speaker_id, overlap)| DominantSpeaker {
+        speaker_id,
+        overlap_ms: overlap,
+        ratio: (overlap as f32) / dur,
+        is_confident: false,
+    })
 }
 
 fn overlap_ms(a0: i64, a1: i64, b0: i64, b1: i64) -> i64 {
@@ -672,14 +890,7 @@ fn merge_fragmented_segments_impl(
         let a = segments[i].clone();
         let b = segments[i + 1].clone();
 
-        if !same_diarization_speaker(
-            diarization,
-            a.start_ms,
-            a.end_ms,
-            b.start_ms,
-            b.end_ms,
-            opts,
-        ) {
+        if !can_merge_across_speaker(diarization, &a, &b, opts) {
             i += 1;
             continue;
         }
@@ -816,14 +1027,7 @@ fn merge_dangling_segments_impl(
         let a = segments[i].clone();
         let b = segments[i + 1].clone();
 
-        if !same_diarization_speaker(
-            diarization,
-            a.start_ms,
-            a.end_ms,
-            b.start_ms,
-            b.end_ms,
-            opts,
-        ) {
+        if !can_merge_across_speaker(diarization, &a, &b, opts) {
             i += 1;
             continue;
         }
@@ -866,6 +1070,31 @@ fn merge_dangling_segments_impl(
 
         segments.remove(i + 1);
     }
+}
+
+fn can_merge_across_speaker(
+    diarization: &[DiarizationSegment],
+    a: &SttSegment,
+    b: &SttSegment,
+    opts: &SttOptions,
+) -> bool {
+    if !opts.require_same_speaker_for_merges || diarization.is_empty() {
+        return true;
+    }
+
+    let da = dominant_speaker(diarization, a.start_ms, a.end_ms);
+    let db = dominant_speaker(diarization, b.start_ms, b.end_ms);
+
+    let (Some(mut da), Some(mut db)) = (da, db) else {
+        return true;
+    };
+
+    da.is_confident =
+        da.overlap_ms >= opts.speaker_min_overlap_ms || da.ratio >= opts.speaker_min_overlap_ratio;
+    db.is_confident =
+        db.overlap_ms >= opts.speaker_min_overlap_ms || db.ratio >= opts.speaker_min_overlap_ratio;
+
+    !(da.is_confident && db.is_confident && da.speaker_id != db.speaker_id)
 }
 
 fn ends_with_bad_terminal(text: &str) -> bool {
@@ -928,13 +1157,14 @@ fn join_sentences(a: &str, b: &str) -> String {
 // dedupe_stutters
 // ------------------------------
 
-fn dedupe_stutters_text(input: &str) -> String {
+fn dedupe_stutters_text(input: &str, max_ngram: usize) -> String {
     let mut tokens: Vec<String> = input.split_whitespace().map(|s| s.to_string()).collect();
     if tokens.is_empty() {
         return input.trim().to_string();
     }
 
     tokens = remove_adjacent_duplicates(tokens);
+    tokens = remove_adjacent_repeated_ngrams(tokens, max_ngram);
 
     if tokens.len() >= 2 && is_single_letter(&tokens[0]) && eq_loose(&tokens[1], "yes") {
         tokens.remove(0);
@@ -973,6 +1203,55 @@ fn remove_adjacent_duplicates(tokens: Vec<String>) -> Vec<String> {
     out
 }
 
+fn remove_adjacent_repeated_ngrams(mut tokens: Vec<String>, max_ngram: usize) -> Vec<String> {
+    if tokens.len() < 4 || max_ngram < 2 {
+        return tokens;
+    }
+
+    let max_ngram = max_ngram.min(6);
+
+    let mut i = 0usize;
+    while i + 1 < tokens.len() {
+        let remaining = tokens.len() - i;
+        let mut removed_any = false;
+
+        for n in (2..=max_ngram).rev() {
+            if remaining < 2 * n {
+                continue;
+            }
+
+            let a = &tokens[i..i + n];
+            let b = &tokens[i + n..i + 2 * n];
+
+            if ngram_eq(a, b) {
+                tokens.drain(i + n..i + 2 * n);
+                removed_any = true;
+                break;
+            }
+        }
+
+        if !removed_any {
+            i += 1;
+        }
+    }
+
+    tokens
+}
+
+fn ngram_eq(a: &[String], b: &[String]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+
+    for (x, y) in a.iter().zip(b.iter()) {
+        if normalize_token(x) != normalize_token(y) {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn drop_known_pair(tokens: Vec<String>, a: &str, b: &str) -> Vec<String> {
     if tokens.len() < 2 {
         return tokens;
@@ -1005,8 +1284,11 @@ fn eq_loose(a: &str, b: &str) -> bool {
 }
 
 fn normalize_token(s: &str) -> String {
-    s.trim_matches(|c: char| !c.is_ascii_alphanumeric())
-        .to_ascii_lowercase()
+    normalize_token_keep(s, |c| c.is_ascii_alphanumeric())
+}
+
+fn normalize_filler_token(s: &str) -> String {
+    normalize_token_keep(s, |c| c.is_ascii_alphabetic())
 }
 
 fn remove_adjacent_pair(tokens: &mut Vec<String>, a: &str, b: &str, remove_first: bool) {
@@ -1046,4 +1328,137 @@ fn fix_comma_spacing(input: &str) -> String {
     }
 
     out
+}
+
+fn cleanup_discourse_collisions_text(input: &str) -> String {
+    let tokens: Vec<&str> = input.split_whitespace().collect();
+    if tokens.len() < 2 {
+        return input.trim().to_string();
+    }
+
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut i = 0usize;
+
+    while i < tokens.len() {
+        let t = tokens[i];
+
+        if i + 1 < tokens.len() && normalize_token(t) == "from" && is_filler_token(tokens[i + 1]) {
+            i += 1;
+            continue;
+        }
+
+        out.push(t.to_string());
+        i += 1;
+    }
+
+    normalize_punctuation_spacing_text(&out.join(" "))
+}
+
+fn is_filler_token(s: &str) -> bool {
+    matches!(
+        normalize_token(s).as_str(),
+        "yeah" | "uh" | "um" | "er" | "ah" | "like"
+    )
+}
+
+fn normalize_punctuation_spacing_text(input: &str) -> String {
+    let mut out = input.trim().to_string();
+
+    // remove spaces before punctuation
+    out = out.replace(" ,", ",");
+    out = out.replace(" .", ".");
+    out = out.replace(" !", "!");
+    out = out.replace(" ?", "?");
+    out = out.replace(" ;", ";");
+    out = out.replace(" :", ":");
+
+    let chars: Vec<char> = out.chars().collect();
+    let mut fixed = String::with_capacity(out.len() + 8);
+
+    let mut prev_emitted: Option<char> = None;
+
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        fixed.push(c);
+
+        if matches!(c, '.' | '!' | '?') && i + 1 < chars.len() {
+            let n = chars[i + 1];
+
+            let is_decimal_dot = c == '.'
+                && prev_emitted.map(|p| p.is_ascii_digit()).unwrap_or(false)
+                && n.is_ascii_digit();
+
+            if !is_decimal_dot && n.is_ascii_alphanumeric() {
+                fixed.push(' ');
+            }
+        }
+
+        prev_emitted = Some(c);
+        i += 1;
+    }
+
+    fixed.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn remove_fillers_text(input: &str, filler_max_len: usize) -> String {
+    let tokens: Vec<&str> = input.split_whitespace().collect();
+    if tokens.is_empty() {
+        return input.trim().to_string();
+    }
+
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+
+    for t in tokens {
+        let norm = normalize_filler_token(t);
+
+        let is_short = norm.len() <= filler_max_len;
+        let is_filler = is_short && is_filler_token_norm(&norm);
+
+        if is_filler {
+            continue;
+        }
+
+        out.push(t.to_string());
+    }
+
+    normalize_punctuation_spacing_text(&out.join(" "))
+}
+
+fn is_filler_token_norm(norm: &str) -> bool {
+    matches!(norm, "uh" | "um" | "er" | "ah" | "eh" | "hmm" | "mmm")
+}
+
+fn finalize_sentence_casing_text(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let mut chars: Vec<char> = trimmed.chars().collect();
+    let mut idx = 0usize;
+
+    while idx < chars.len() {
+        if chars[idx].is_ascii_alphabetic() {
+            break;
+        }
+        idx += 1;
+    }
+
+    if idx < chars.len() {
+        chars[idx] = chars[idx].to_ascii_uppercase();
+    }
+
+    chars.into_iter().collect()
+}
+
+fn normalize_token_keep<F>(s: &str, keep: F) -> String
+where
+    F: Fn(char) -> bool,
+{
+    s.trim_matches(|c: char| !keep(c))
+        .chars()
+        .filter(|&c| keep(c))
+        .collect::<String>()
+        .to_ascii_lowercase()
 }

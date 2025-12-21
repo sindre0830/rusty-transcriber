@@ -14,20 +14,30 @@ pub struct DiarizationSegment {
     pub speaker_id: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Diarization {
     pub segments: Vec<DiarizationSegment>,
 }
 
-impl Diarization {
-    pub fn new() -> Self {
+#[derive(Debug, Clone, Copy)]
+pub struct DiarizationOptions {
+    pub min_segment_ms: i64,
+    pub merge_same_speaker_gap_ms: i64,
+    pub min_vad_overlap_ratio: f32,
+}
+
+impl Default for DiarizationOptions {
+    fn default() -> Self {
         Self {
-            segments: Vec::new(),
+            min_segment_ms: 300,
+            merge_same_speaker_gap_ms: 1000,
+            min_vad_overlap_ratio: 0.25,
         }
     }
+}
 
+impl Diarization {
     pub fn from_sortformer(
-        mut self,
         samples: &[f32],
         sample_rate: u32,
         channels: u8,
@@ -40,34 +50,44 @@ impl Diarization {
             .diarize(samples.to_vec(), sample_rate, channels as u16)
             .context("sortformer diarization failed")?;
 
-        self.segments = segments
-            .into_iter()
-            .map(|s| DiarizationSegment {
-                start_ms: seconds_to_ms(s.start),
-                end_ms: seconds_to_ms(s.end),
-                speaker_id: s.speaker_id,
-            })
-            .collect();
-        Ok(self)
+        let mut out = Self {
+            segments: segments
+                .into_iter()
+                .map(|s| DiarizationSegment {
+                    start_ms: seconds_to_ms(s.start),
+                    end_ms: seconds_to_ms(s.end),
+                    speaker_id: s.speaker_id,
+                })
+                .collect(),
+        };
+
+        out.normalize_basic();
+        Ok(out)
     }
 
     pub fn sort_by_start(mut self) -> Self {
-        self.segments.sort_by_key(|s| s.start_ms);
+        if self.segments.len() > 1 {
+            self.segments.sort_by_key(|s| s.start_ms);
+        }
         self
     }
 
     pub fn drop_short(mut self, min_duration_ms: i64) -> Self {
         self.segments
-            .retain(|s| s.end_ms - s.start_ms >= min_duration_ms);
+            .retain(|s| (s.end_ms - s.start_ms) >= min_duration_ms);
         self
     }
 
     pub fn merge_same_speaker_gaps(mut self, max_gap_ms: i64) -> Self {
+        if self.segments.len() < 2 {
+            return self;
+        }
+
         self.segments.sort_by_key(|s| s.start_ms);
 
         let mut merged: Vec<DiarizationSegment> = Vec::with_capacity(self.segments.len());
 
-        for seg in self.segments {
+        for seg in self.segments.into_iter() {
             if let Some(last) = merged.last_mut() {
                 let gap = seg.start_ms - last.end_ms;
 
@@ -84,7 +104,6 @@ impl Diarization {
         self
     }
 
-    /// This enforces monophonic diarization (one speaker at a time).
     pub fn drop_contained_segments(mut self) -> Self {
         if self.segments.len() < 2 {
             return self;
@@ -94,16 +113,14 @@ impl Diarization {
 
         let mut result: Vec<DiarizationSegment> = Vec::with_capacity(self.segments.len());
 
-        for seg in self.segments {
+        for seg in self.segments.into_iter() {
             if let Some(last) = result.last_mut() {
                 let fully_inside = seg.start_ms >= last.start_ms && seg.end_ms <= last.end_ms;
 
                 if fully_inside {
-                    // same speaker: merge defensively
                     if seg.speaker_id == last.speaker_id {
                         last.end_ms = last.end_ms.max(seg.end_ms);
                     }
-                    // different speaker: drop inner segment
                     continue;
                 }
             }
@@ -115,8 +132,11 @@ impl Diarization {
         self
     }
 
-    /// Re-index speakers to 0..N by first appearance (better UX / stable output).
     pub fn normalize_speaker_ids(mut self) -> Self {
+        if self.segments.is_empty() {
+            return self;
+        }
+
         self.segments.sort_by_key(|s| s.start_ms);
 
         let mut map: HashMap<usize, usize> = HashMap::new();
@@ -135,10 +155,8 @@ impl Diarization {
         self
     }
 
-    /// Intersects diarization segments with VAD speech segments.
-    /// This trims diarization to only regions where speech exists.
     pub fn trim_to_vad(mut self, vad: &[VadSegment]) -> Self {
-        if self.segments.is_empty() || vad.is_empty() {
+        if vad.is_empty() || self.segments.is_empty() {
             self.segments.clear();
             return self;
         }
@@ -148,7 +166,7 @@ impl Diarization {
         let mut vad_sorted: Vec<VadSegment> = vad.to_vec();
         vad_sorted.sort_by_key(|s| s.start_ms);
 
-        let mut out: Vec<DiarizationSegment> = Vec::new();
+        let mut out: Vec<DiarizationSegment> = Vec::with_capacity(self.segments.len());
 
         let mut i = 0usize;
         let mut j = 0usize;
@@ -185,13 +203,12 @@ impl Diarization {
         }
 
         self.segments = out;
+        self.normalize_basic();
         self
     }
 
-    /// Drops diarization segments that contain too little speech according to VAD.
-    /// `min_ratio` is overlap_ms / diar_dur_ms, recommended 0.20..0.35.
     pub fn drop_low_vad_overlap(mut self, vad: &[VadSegment], min_ratio: f32) -> Self {
-        if self.segments.is_empty() || vad.is_empty() {
+        if vad.is_empty() || self.segments.is_empty() {
             self.segments.clear();
             return self;
         }
@@ -201,79 +218,96 @@ impl Diarization {
         let mut vad_sorted: Vec<VadSegment> = vad.to_vec();
         vad_sorted.sort_by_key(|s| s.start_ms);
 
+        let mut j = 0usize;
+
         self.segments.retain(|d| {
-            let dur = (d.end_ms - d.start_ms).max(0);
+            let dur = d.end_ms - d.start_ms;
             if dur <= 0 {
                 return false;
             }
 
-            let overlap = total_overlap_ms(d.start_ms, d.end_ms, &vad_sorted);
+            while j < vad_sorted.len() && vad_sorted[j].end_ms <= d.start_ms {
+                j += 1;
+            }
+
+            let mut k = j;
+            let mut overlap = 0i64;
+
+            while k < vad_sorted.len() {
+                let v = &vad_sorted[k];
+
+                if v.start_ms >= d.end_ms {
+                    break;
+                }
+
+                let lo = d.start_ms.max(v.start_ms);
+                let hi = d.end_ms.min(v.end_ms);
+
+                if hi > lo {
+                    overlap += hi - lo;
+                }
+
+                k += 1;
+            }
+
             (overlap as f32) / (dur as f32) >= min_ratio
         });
 
         self
     }
 
-    /// VAD-aware default post-processing chain.
-    /// Trims diarization to speech regions and optionally drops low-overlap segments.
-    pub fn post_process_default_with_vad(self, vad: &[VadSegment]) -> Self {
+    pub fn post_process(self, vad: &[VadSegment], opts: &DiarizationOptions) -> Self {
         self.sort_by_start()
-            .drop_short(300)
+            .drop_short(opts.min_segment_ms)
             .trim_to_vad(vad)
-            .drop_low_vad_overlap(vad, 0.25)
-            .merge_same_speaker_gaps(1000)
+            .drop_low_vad_overlap(vad, opts.min_vad_overlap_ratio)
+            .merge_same_speaker_gaps(opts.merge_same_speaker_gap_ms)
             .drop_contained_segments()
             .normalize_speaker_ids()
     }
 
-    /// Returns the speaker_id that overlaps most with the given time window.
-    /// If no overlap exists, returns None.
     pub fn speaker_for_window(&self, start_ms: i64, end_ms: i64) -> Option<usize> {
-        if start_ms >= end_ms {
+        if start_ms >= end_ms || self.segments.is_empty() {
             return None;
         }
 
         let mut overlap_per_speaker: HashMap<usize, i64> = HashMap::new();
+        let mut best_speaker: Option<usize> = None;
+        let mut best_overlap: i64 = 0;
 
         for seg in &self.segments {
+            if seg.end_ms <= start_ms {
+                continue;
+            }
+            if seg.start_ms >= end_ms {
+                break;
+            }
+
             let overlap_start = start_ms.max(seg.start_ms);
             let overlap_end = end_ms.min(seg.end_ms);
 
-            if overlap_end > overlap_start {
-                let overlap = overlap_end - overlap_start;
-                *overlap_per_speaker.entry(seg.speaker_id).or_insert(0) += overlap;
+            if overlap_end <= overlap_start {
+                continue;
+            }
+
+            let overlap = overlap_end - overlap_start;
+            let entry = overlap_per_speaker.entry(seg.speaker_id).or_insert(0);
+            *entry += overlap;
+
+            if *entry > best_overlap {
+                best_overlap = *entry;
+                best_speaker = Some(seg.speaker_id);
             }
         }
 
-        overlap_per_speaker
-            .into_iter()
-            .max_by_key(|(_, overlap)| *overlap)
-            .map(|(speaker_id, _)| speaker_id)
-    }
-}
-
-fn total_overlap_ms(start_ms: i64, end_ms: i64, vad: &[VadSegment]) -> i64 {
-    if start_ms >= end_ms {
-        return 0;
+        best_speaker
     }
 
-    let mut total = 0i64;
+    fn normalize_basic(&mut self) {
+        self.segments.retain(|s| s.start_ms < s.end_ms);
 
-    for v in vad {
-        if v.end_ms <= start_ms {
-            continue;
-        }
-        if v.start_ms >= end_ms {
-            break;
-        }
-
-        let lo = start_ms.max(v.start_ms);
-        let hi = end_ms.min(v.end_ms);
-
-        if hi > lo {
-            total += hi - lo;
+        if self.segments.len() > 1 {
+            self.segments.sort_by_key(|s| s.start_ms);
         }
     }
-
-    total
 }

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::diarization::Diarization;
+use crate::diarization::{Diarization, DiarizationOptions};
 use crate::io::{
     ModelInput, RetrieveBinaryOptions, retrieve_batch_files, retrieve_binary, samples_fingerprint,
 };
@@ -111,9 +111,9 @@ impl Transcript {
 
         let vad = Vad::from_earshot(samples, sample_rate, channels, &VadOptions::default())?;
 
-        let diarization = Diarization::new()
-            .from_sortformer(samples, sample_rate, channels, diarization_model_path)?
-            .post_process_default_with_vad(&vad.segments);
+        let diarization =
+            Diarization::from_sortformer(samples, sample_rate, channels, diarization_model_path)?
+                .post_process(&vad.segments, &DiarizationOptions::default());
 
         let stt = Stt::new()
             .from_parakeet_tdt(

@@ -1,11 +1,9 @@
 # Rusty Transcriber
 
 **Rusty Transcriber** is a lightweight Rust crate for converting raw PCM audio data into text transcripts using speech-to-text models.
-Currently supports OpenAI Whisper models through [whisper-rs](https://codeberg.org/tazz4843/whisper-rs).
+Currently supports Nvidia Parakeet models through [parakeet-rs](https://github.com/altunenes/parakeet-rs).
 
-## Prerequisites
-
-* `libclang` required for whisper-rs
+The Parakeet ONNX models (downloaded separately from HuggingFace) are licensed under CC-BY-4.0 by NVIDIA. This library does not distribute the models.
 
 ---
 
@@ -14,14 +12,14 @@ Currently supports OpenAI Whisper models through [whisper-rs](https://codeberg.o
 To include this crate in your project, add it to your dependencies:
 
 ```bash
-cargo add --git https://github.com/sindre0830/rusty-transcriber.git --tag v0.1.0 rusty-transcriber
+cargo add --git https://github.com/sindre0830/rusty-transcriber.git --tag v1.0.0 rusty-transcriber
 ```
 
 Or manually in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rusty-transcriber = { git = "https://github.com/sindre0830/rusty-transcriber.git", tag = "v0.1.0" }
+rusty-transcriber = { git = "https://github.com/sindre0830/rusty-transcriber.git", tag = "v1.0.0" }
 ```
 
 ### Example
@@ -29,99 +27,65 @@ rusty-transcriber = { git = "https://github.com/sindre0830/rusty-transcriber.git
 This examples uses the [rusty-pcm-resolver](https://github.com/sindre0830/rusty-pcm-resolver) crate for preparing audio samples.
 
 ```rust
+use anyhow::Context;
 use rusty_pcm_resolver::PcmResolver;
 use rusty_pcm_resolver::domain::MediaInput;
 
-use rusty_transcriber::{ModelInput, Options, RetrieveBinaryOptions, TranscriberBuilder};
+use rusty_transcriber::{Transcript, TranscriptOptions};
 
 fn main() -> anyhow::Result<()> {
+    let program_start = std::time::Instant::now();
+
+    let sample_rate: u32 = 16_000;
+    let channels: u8 = 1;
+
     let pcm_resolver_options =
-        rusty_pcm_resolver::Options::new(MediaInput::Url("https://url.to/audio".into()));
+        rusty_pcm_resolver::Options::new(MediaInput::Url("https://url.to/audio".into()))
+            .sample_rate(sample_rate)
+            .channels(channels);
+
     let samples = PcmResolver::new(pcm_resolver_options)
         .resolve_media()?
         .convert_to_pcm()?
         .load()?;
     println!("Samples: {}", samples.len());
 
-    let model_options = RetrieveBinaryOptions::default();
-    let options = Options::new().language("en").threads(6);
-    let transcript = TranscriberBuilder::new(options)
-        .load_model(
-            ModelInput::Url(
-                "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin".into(),
-            ),
-            model_options,
+    let options = TranscriptOptions::new();
+    let transcript = Transcript::new(options)
+        .prepare_transcriber_model(
+            rusty_transcriber::io::ModelInput::BatchUrls(vec![
+                "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/encoder-model.onnx".into(),
+                "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/encoder-model.onnx.data".into(),
+                "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/decoder_joint-model.onnx".into(),
+                "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/vocab.txt".into(),
+            ]),
+            rusty_transcriber::io::RetrieveBinaryOptions::default(),
         )?
-        .transcribe(samples)?
-        .merge_sentences();
+        .prepare_diarization_model(
+            rusty_transcriber::io::ModelInput::Url(
+                "https://huggingface.co/altunenes/parakeet-rs/resolve/main/diar_streaming_sortformer_4spk-v2.1.onnx".into(),
+            ),
+            rusty_transcriber::io::RetrieveBinaryOptions::default(),
+        )?
+        .transcribe(&samples, sample_rate, channels)
+        .context("transcription failed")?;
 
     println!("Segments: {}", transcript.segments.len());
     for seg in &transcript.segments {
-        println!("[{:.2} - {:.2}] {}", seg.start_ms, seg.end_ms, seg.text);
+        println!(
+            "[{} {} - {}] {}",
+            seg.speaker_id, seg.start_ms, seg.end_ms, seg.text
+        );
     }
+
+    println!(
+        "\nTotal program execution time: {:.2?}",
+        program_start.elapsed()
+    );
 
     Ok(())
 }
 ```
-
----
-
-## API Overview
-
-### Core Flow (Builder)
-
-| Method                             | Input                                 | Output                       | Description                                                                                   |
-| ---------------------------------- | ------------------------------------- | ---------------------------- | --------------------------------------------------------------------------------------------- |
-| `TranscriberBuilder::new(options)` | `Options`                             | `TranscriberBuilder`         | Create a builder with runtime/config options.                                                 |
-| `load_model(input, model_options)` | `ModelInput`, `RetrieveBinaryOptions` | `Result<TranscriberBuilder>` | Resolve the Whisper model path. Downloads if URL is given.                                    |
-| `transcribe(samples)`              | `Vec<f32>` (mono 16 kHz)              | `Result<Transcript>`         | Run Whisper on in-memory PCM samples. Uses cached transcript if available.                    |
-| `merge_sentences()`                | —                                     | `Transcript`                 | Combine adjacent short fragments into sentence-level segments. Optional post-processing step. |
-
-> Order: **new -> load_model -> transcribe -> merge_sentences (optional)**
-
----
-
-### Configuration
-
-#### `Options` (transcription runtime)
-
-| Field                  | Type             | Default  | Description                                          |
-| ---------------------- | ---------------- | -------- | ---------------------------------------------------- |
-| `language`             | `Option<String>` | `None`   | Target language code (e.g., `"en"`).                 |
-| `translate_to_english` | `bool`           | `false`  | Translate output to English if supported.            |
-| `n_threads`            | `i32`            | `4`      | Number of CPU threads used by Whisper.               |
-| `cache_dir`            | `PathBuf`        | `.cache` | Root directory for transcript caching.               |
-| `model_fingerprint`    | `Option<String>` | `None`   | Optional override; otherwise computed automatically. |
-
-#### `RetrieveBinaryOptions` (model download)
-
-| Field               | Type             | Default  | Description                       |
-| ------------------- | ---------------- | -------- | --------------------------------- |
-| `cache_dir`         | `PathBuf`        | `.cache` | Base model cache directory.       |
-| `filename_override` | `Option<String>` | `None`   | Custom filename for the download. |
-| `expected_sha256`   | `Option<String>` | `None`   | Optional integrity verification.  |
-| `timeout`           | `Duration`       | `60 s`   | HTTP timeout.                     |
-| `user_agent`        | `Option<String>` | `None`   | Custom User-Agent header.         |
-
----
-
-### Types
-
-| Type         | Description                                                                                             |
-| ------------ | ------------------------------------------------------------------------------------------------------- |
-| `ModelInput` | `Path(PathBuf)` or `Url(String)` — where to load the Whisper model from.                                |
-| `Segment`    | `{ start_ms: i64, end_ms: i64, text: String }` — individual decoded chunk.                              |
-| `Transcript` | `{ segments: Vec<Segment> }` — full transcription result with `.merge_sentences()` for post-processing. |
-
----
-
-### Utilities
-
-| Function            | Input                            | Output            | Description                                                      |
-| ------------------- | -------------------------------- | ----------------- | ---------------------------------------------------------------- |
-| `retrieve_binary`   | `&str`, `&RetrieveBinaryOptions` | `Result<PathBuf>` | Downloads and caches a binary file (e.g., model).                |
-| `model_fingerprint` | `&Path`                          | `Result<String>`  | Returns a `blake3` fingerprint of model bytes.                   |
-| `hash_samples`      | `&[f32]`                         | `String`          | Computes `blake3` hash of PCM content for deterministic caching. |
 
 ---
 

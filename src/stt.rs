@@ -295,13 +295,13 @@ fn build_vad_windows(
     out
 }
 
-fn slice_by_ms<'a>(
-    samples: &'a [f32],
+fn slice_by_ms(
+    samples: &[f32],
     sample_rate: u32,
     channels: u8,
     start_ms: i64,
     end_ms: i64,
-) -> (&'a [f32], i64) {
+) -> (&[f32], i64) {
     let sr = sample_rate as i64;
     let ch = channels as i64;
 
@@ -494,9 +494,7 @@ fn first_ascii_word(s: &str) -> String {
     for ch in s.chars() {
         if ch.is_ascii_alphanumeric() {
             out.push(ch);
-        } else if !out.is_empty() {
-            break;
-        } else if !ch.is_whitespace() {
+        } else if !out.is_empty() || !ch.is_whitespace() {
             break;
         }
     }
@@ -1055,7 +1053,7 @@ fn merge_dangling_segments_impl(
         }
 
         let left = if bad_terminal {
-            a_text.trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':'))
+            a_text.trim_end_matches(['.', ',', ';', ':'])
         } else {
             a_text
         };
@@ -1193,10 +1191,10 @@ fn dedupe_stutters_text(input: &str, max_ngram: usize) -> String {
 fn remove_adjacent_duplicates(tokens: Vec<String>) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(tokens.len());
     for t in tokens {
-        if let Some(last) = out.last() {
-            if normalize_token(last) == normalize_token(&t) {
-                continue;
-            }
+        if let Some(last) = out.last()
+            && normalize_token(last) == normalize_token(&t)
+        {
+            continue;
         }
         out.push(t);
     }
@@ -1317,10 +1315,14 @@ fn fix_comma_spacing(input: &str) -> String {
 
         if c == ',' {
             let next = chars.get(i + 1).copied();
-            if let Some(n) = next {
-                if !n.is_whitespace() && n != ',' && n != '.' && n != '!' && n != '?' {
-                    out.push(' ');
-                }
+            if let Some(n) = next
+                && !n.is_whitespace()
+                && n != ','
+                && n != '.'
+                && n != '!'
+                && n != '?'
+            {
+                out.push(' ');
             }
         }
 

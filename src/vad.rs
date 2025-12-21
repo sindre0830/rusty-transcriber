@@ -78,7 +78,6 @@ impl Vad {
         let mut last_speech_frame_end_ms: i64 = 0;
         let mut pending_silence_ms: i64 = 0;
 
-        // allocate once, fill each frame
         let mut pcm: [i16; FRAME_SAMPLES] = [0; FRAME_SAMPLES];
 
         for (frame_idx, frame) in samples.chunks_exact(FRAME_SAMPLES).enumerate() {

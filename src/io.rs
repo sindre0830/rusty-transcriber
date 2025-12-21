@@ -9,7 +9,6 @@ use reqwest::redirect::Policy;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
-/// model source type (local or remote)
 pub enum ModelInput {
     Path(PathBuf),
     Url(String),
@@ -241,25 +240,21 @@ pub fn samples_fingerprint(samples: &[f32]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// Download multiple files from URLs into a single subfolder and return the folder path.
-/// Creates a unique folder based on the combined URLs, useful for models requiring multiple files.
 pub fn retrieve_batch_files(urls: &[String], opts: &RetrieveBinaryOptions) -> Result<PathBuf> {
     if urls.is_empty() {
         bail!("batch urls cannot be empty");
     }
 
-    // Create a unique folder name based on all URLs combined
     let mut hasher = blake3::Hasher::new();
     for url in urls {
         hasher.update(url.as_bytes());
-        hasher.update(b"|"); // separator
+        hasher.update(b"|");
     }
     let folder_name = hasher.finalize().to_hex().to_string();
 
     let cache_dir = opts.cache_dir.join(&opts.namespace);
     let model_dir = cache_dir.join(folder_name);
 
-    // Extract filenames from URLs
     let filenames: Vec<String> = urls
         .iter()
         .map(|url| {
@@ -268,30 +263,25 @@ pub fn retrieve_batch_files(urls: &[String], opts: &RetrieveBinaryOptions) -> Re
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // Check if all files already exist
     let all_exist = filenames.iter().all(|f| model_dir.join(f).exists());
 
     if all_exist {
         return Ok(model_dir);
     }
 
-    // Create the model directory
     fs::create_dir_all(&model_dir).context("failed to create batch download directory")?;
 
-    // Download each file
     for (url, filename) in urls.iter().zip(filenames.iter()) {
         let file_path = model_dir.join(filename);
 
-        // Skip if file already exists
         if file_path.exists() {
             continue;
         }
 
-        // Create a temporary RetrieveBinaryOptions for this file
         let file_opts = RetrieveBinaryOptions {
             cache_dir: model_dir.clone(),
             namespace: PathBuf::from(""),
-            filename_override: Some(filename.clone()),
+            filename_override: None,
             expected_sha256: None,
             timeout: opts.timeout,
             user_agent: opts.user_agent.clone(),

@@ -5,6 +5,8 @@ use rusty_pcm_resolver::domain::MediaInput;
 use rusty_transcriber::{Transcript, TranscriptOptions};
 
 fn main() -> anyhow::Result<()> {
+    let program_start = std::time::Instant::now();
+
     let sample_rate: u32 = 16_000;
     let channels: u8 = 1;
 
@@ -42,10 +44,15 @@ fn main() -> anyhow::Result<()> {
     println!("Segments: {}", transcript.segments.len());
     for seg in &transcript.segments {
         println!(
-            "[{} {:.2} - {:.2}] {}",
+            "[{} {} - {}] {}",
             seg.speaker_id, seg.start_ms, seg.end_ms, seg.text
         );
     }
+
+    println!(
+        "\nTotal program execution time: {:.2?}",
+        program_start.elapsed()
+    );
 
     Ok(())
 }

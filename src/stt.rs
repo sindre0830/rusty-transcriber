@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use parakeet_rs::{ParakeetTDT, TimestampMode, Transcriber};
+use rusty_paragraphizer::ParagraphGrouper;
 
 use crate::diarization::DiarizationSegment;
 use crate::utils::seconds_to_ms;
@@ -43,6 +44,12 @@ pub struct SttOptions {
 
     pub remove_fillers: bool,
     pub filler_max_len: usize,
+
+    pub enable_paragraphs: bool,
+    pub paragraph_split_threshold: f32,
+    pub paragraph_min_sentences: usize,
+    pub paragraph_rank_window: usize,
+    pub paragraph_block_depth: usize,
 }
 
 impl Default for SttOptions {
@@ -70,6 +77,12 @@ impl Default for SttOptions {
 
             remove_fillers: true,
             filler_max_len: 4,
+
+            enable_paragraphs: true,
+            paragraph_split_threshold: 0.55,
+            paragraph_min_sentences: 2,
+            paragraph_rank_window: 2,
+            paragraph_block_depth: 2,
         }
     }
 }
@@ -152,8 +165,15 @@ impl Stt {
             out = out.cleanup_discourse_collisions();
         }
 
-        out.normalize_punctuation_spacing()
-            .finalize_sentence_casing()
+        out = out
+            .normalize_punctuation_spacing()
+            .finalize_sentence_casing();
+
+        if opts.enable_paragraphs {
+            out = out.group_into_paragraphs(diarization, opts);
+        }
+
+        out
     }
 
     pub fn format_numbers_and_spacing(mut self) -> Self {
@@ -240,6 +260,47 @@ impl Stt {
         for seg in &mut self.segments {
             seg.text = finalize_sentence_casing_text(&seg.text);
         }
+        self
+    }
+
+    pub fn group_into_paragraphs(
+        mut self,
+        diarization: &[DiarizationSegment],
+        opts: &SttOptions,
+    ) -> Self {
+        if self.segments.len() < 2 {
+            return self;
+        }
+
+        self.segments.sort_by_key(|s| (s.start_ms, s.end_ms));
+
+        let mut out: Vec<SttSegment> = Vec::with_capacity(self.segments.len());
+
+        let mut run: Vec<SttSegment> = Vec::new();
+        let mut prev_spk: Option<usize> = None;
+
+        for seg in self.segments.into_iter() {
+            let cur_spk = segment_speaker_id(diarization, &seg, opts);
+
+            let speaker_changed = match (prev_spk, cur_spk) {
+                (Some(a), Some(b)) => a != b,
+                _ => false,
+            };
+
+            if !run.is_empty() && speaker_changed {
+                out.extend(paragraphize_run(&run, opts));
+                run.clear();
+            }
+
+            prev_spk = cur_spk.or(prev_spk);
+            run.push(seg);
+        }
+
+        if !run.is_empty() {
+            out.extend(paragraphize_run(&run, opts));
+        }
+
+        self.segments = out;
         self
     }
 }
@@ -1463,4 +1524,107 @@ where
         .filter(|&c| keep(c))
         .collect::<String>()
         .to_ascii_lowercase()
+}
+
+fn segment_speaker_id(
+    diarization: &[DiarizationSegment],
+    seg: &SttSegment,
+    opts: &SttOptions,
+) -> Option<usize> {
+    if diarization.is_empty() {
+        return None;
+    }
+
+    let mut dom = dominant_speaker(diarization, seg.start_ms, seg.end_ms)?;
+
+    dom.is_confident = dom.overlap_ms >= opts.speaker_min_overlap_ms
+        || dom.ratio >= opts.speaker_min_overlap_ratio;
+
+    if dom.is_confident {
+        Some(dom.speaker_id)
+    } else {
+        None
+    }
+}
+
+fn paragraphize_run(run: &[SttSegment], opts: &SttOptions) -> Vec<SttSegment> {
+    if run.len() <= 1 {
+        return run.to_vec();
+    }
+
+    let sentences: Vec<String> = run.iter().map(|s| s.text.trim().to_string()).collect();
+
+    let grouper = ParagraphGrouper::new()
+        .split_threshold(opts.paragraph_split_threshold)
+        .min_sentences(opts.paragraph_min_sentences)
+        .rank_window(opts.paragraph_rank_window)
+        .block_depth(opts.paragraph_block_depth);
+
+    let paragraphs = match grouper.group(sentences) {
+        Ok(p) if !p.is_empty() => p,
+        _ => {
+            return run.to_vec();
+        }
+    };
+
+    map_paragraphs_back_to_time_ranges(run, &paragraphs)
+}
+
+fn map_paragraphs_back_to_time_ranges(
+    run: &[SttSegment],
+    paragraphs: &[String],
+) -> Vec<SttSegment> {
+    let mut out: Vec<SttSegment> = Vec::with_capacity(paragraphs.len());
+    let mut i = 0usize;
+
+    for p in paragraphs {
+        if i >= run.len() {
+            break;
+        }
+
+        let p_norm = normalize_ws(p);
+
+        let start_idx = i;
+        let mut acc = String::new();
+        let mut end_idx = i;
+
+        while end_idx < run.len() {
+            if !acc.is_empty() {
+                acc.push(' ');
+            }
+            acc.push_str(run[end_idx].text.trim());
+
+            if normalize_ws(&acc) == p_norm {
+                break;
+            }
+
+            end_idx += 1;
+        }
+
+        if end_idx >= run.len() {
+            end_idx = start_idx;
+        }
+
+        let start_ms = run[start_idx].start_ms;
+        let end_ms = run[end_idx].end_ms;
+
+        out.push(SttSegment {
+            start_ms,
+            end_ms,
+            text: p.trim().to_string(),
+        });
+
+        i = end_idx + 1;
+    }
+
+    while i < run.len() {
+        out.push(run[i].clone());
+        i += 1;
+    }
+
+    out
+}
+
+fn normalize_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }

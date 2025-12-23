@@ -2223,6 +2223,7 @@ dependencies = [
  "earshot",
  "hex",
  "parakeet-rs",
+ "rayon",
  "reqwest",
  "rusty-paragraphizer",
  "rusty-pcm-resolver",

@@ -96,7 +96,11 @@ impl Stt {
         vad_segments: &[VadSegment],
         opts: &SttOptions,
     ) -> Result<Self> {
-        let mut stt_model = ParakeetTDT::from_pretrained(model_path, None)
+        let stt_config = parakeet_rs::ExecutionConfig {
+            execution_provider: parakeet_rs::ExecutionProvider::Cuda,
+            ..Default::default()
+        };
+        let mut stt_model = ParakeetTDT::from_pretrained(model_path, Some(stt_config))
             .context("failed to load TDT STT model")?;
 
         let total_frames = (samples.len() / channels as usize) as i64;

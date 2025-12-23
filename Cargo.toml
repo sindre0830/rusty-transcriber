@@ -8,7 +8,7 @@ anyhow = "1.0.100"
 blake3 = "1.8.2"
 earshot = "0.1.0"
 hex = "0.4.3"
-parakeet-rs = { version = "0.2.6", features = ["sortformer"] }
+parakeet-rs = { version = "0.2.6", features = ["sortformer", "cuda"] }
 reqwest = { version = "0.12.24", features = ["blocking"]}
 rusty-paragraphizer = { git = "https://github.com/sindre0830/rusty-paragraphizer.git", tag = "v0.2.0", version = "0.2.0" }
 rusty-pcm-resolver = { git = "https://github.com/sindre0830/rusty-pcm-resolver.git", tag = "v1.0.0", version = "1.0.0" }

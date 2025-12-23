@@ -43,8 +43,16 @@ impl Diarization {
         channels: u8,
         model_path: &Path,
     ) -> Result<Self> {
-        let mut diarizer =
-            Sortformer::new(model_path).context("failed to load sortformer diarization model")?;
+        let diar_config = parakeet_rs::ExecutionConfig {
+            execution_provider: parakeet_rs::ExecutionProvider::Cuda,
+            ..Default::default()
+        };
+        let mut diarizer = Sortformer::with_config(
+            model_path,
+            Some(diar_config),
+            parakeet_rs::sortformer::DiarizationConfig::default(),
+        )
+        .context("failed to load sortformer diarization model")?;
 
         let segments = diarizer
             .diarize(samples.to_vec(), sample_rate, channels as u16)
@@ -62,6 +70,7 @@ impl Diarization {
         };
 
         out.normalize_basic();
+
         Ok(out)
     }
 

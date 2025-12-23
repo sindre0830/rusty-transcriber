@@ -111,19 +111,36 @@ impl Transcript {
 
         let vad = Vad::from_earshot(samples, sample_rate, channels, &VadOptions::default())?;
 
-        let diarization =
-            Diarization::from_sortformer(samples, sample_rate, channels, diarization_model_path)?
-                .post_process(&vad.segments, &DiarizationOptions::default());
+        let diar_pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
 
-        let stt = Stt::from_parakeet_tdt(
-            samples,
-            sample_rate,
-            channels,
-            transcriber_model_path,
-            &vad.segments,
-            &SttOptions::default(),
-        )?
-        .post_process(&diarization.segments, &vad.segments, &SttOptions::default());
+        let (diarization_result, stt_result) = rayon::join(
+            || {
+                diar_pool.install(|| {
+                    Diarization::from_sortformer(
+                        samples,
+                        sample_rate,
+                        channels,
+                        diarization_model_path,
+                    )
+                })
+            },
+            || {
+                Stt::from_parakeet_tdt(
+                    samples,
+                    sample_rate,
+                    channels,
+                    transcriber_model_path,
+                    &vad.segments,
+                    &SttOptions::default(),
+                )
+            },
+        );
+
+        let diarization =
+            diarization_result?.post_process(&vad.segments, &DiarizationOptions::default());
+
+        let stt =
+            stt_result?.post_process(&diarization.segments, &vad.segments, &SttOptions::default());
 
         self.segments = stt
             .segments

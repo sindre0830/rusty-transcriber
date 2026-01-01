@@ -9,6 +9,7 @@ use reqwest::redirect::Policy;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
+#[derive(Clone, Debug)]
 pub enum ModelInput {
     Path(PathBuf),
     Url(String),

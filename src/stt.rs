@@ -9,6 +9,8 @@ use crate::diarization::DiarizationSegment;
 use crate::utils::seconds_to_ms;
 use crate::vad::VadSegment;
 
+const MIN_TRANSCRIBE_WINDOW_MS: i64 = 100;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SttSegment {
     pub start_ms: i64,
@@ -147,6 +149,9 @@ impl Stt {
                 slice_by_ms(samples, sample_rate, channels, w.start_ms, w.end_ms);
 
             if chunk.is_empty() {
+                continue;
+            }
+            if chunk_too_short_for_model(chunk.len(), sample_rate, channels) {
                 continue;
             }
 
@@ -404,7 +409,13 @@ fn build_vad_windows(
     for s in merged {
         let mut cur_start = s.start_ms;
         while cur_start < s.end_ms {
-            let cur_end = (cur_start + max_window_ms).min(s.end_ms);
+            let mut cur_end = (cur_start + max_window_ms).min(s.end_ms);
+
+            let tail_ms = s.end_ms - cur_end;
+            if tail_ms > 0 && tail_ms < MIN_TRANSCRIBE_WINDOW_MS {
+                cur_end = s.end_ms;
+            }
+
             out.push(VadWindow {
                 start_ms: cur_start,
                 end_ms: cur_end,
@@ -413,7 +424,21 @@ fn build_vad_windows(
         }
     }
 
-    out
+    out.into_iter()
+        .filter(|w| (w.end_ms - w.start_ms) >= MIN_TRANSCRIBE_WINDOW_MS)
+        .collect()
+}
+
+fn chunk_too_short_for_model(chunk_len: usize, sample_rate: u32, channels: u8) -> bool {
+    if channels == 0 {
+        return true;
+    }
+
+    let samples_per_channel = chunk_len / channels as usize;
+    let min_samples_per_channel =
+        ((sample_rate as usize) * (MIN_TRANSCRIBE_WINDOW_MS as usize)).div_ceil(1000);
+
+    samples_per_channel < min_samples_per_channel
 }
 
 fn slice_by_ms(

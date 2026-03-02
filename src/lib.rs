@@ -91,6 +91,16 @@ impl Transcript {
     }
 
     pub fn transcribe(mut self, samples: &[f32], sample_rate: u32, channels: u8) -> Result<Self> {
+        if sample_rate == 0 {
+            anyhow::bail!("sample_rate must be > 0");
+        }
+        if channels == 0 {
+            anyhow::bail!("channels must be > 0");
+        }
+        if samples.is_empty() {
+            anyhow::bail!("samples cannot be empty");
+        }
+
         let transcriber_model_path = self
             .transcriber_model_path
             .as_ref()

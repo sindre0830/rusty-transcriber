@@ -1,3 +1,4 @@
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -96,6 +97,32 @@ impl Stt {
         vad_segments: &[VadSegment],
         opts: &SttOptions,
     ) -> Result<Self> {
+        if sample_rate == 0 {
+            anyhow::bail!("sample_rate must be > 0");
+        }
+        if channels == 0 {
+            anyhow::bail!("channels must be > 0");
+        }
+        if opts.max_window_ms <= 0 {
+            anyhow::bail!("max_window_ms must be > 0");
+        }
+        if opts.max_window_ms > 120_000 {
+            anyhow::bail!(
+                "max_window_ms is too large ({} ms). Keep it <= 120000 ms to avoid oversized model tensors.",
+                opts.max_window_ms
+            );
+        }
+
+        let frame_width = channels as usize;
+        let usable_len = samples.len() - (samples.len() % frame_width);
+        if usable_len == 0 {
+            anyhow::bail!(
+                "audio buffer is too short for channels ({}) after frame alignment",
+                channels
+            );
+        }
+        let samples = &samples[..usable_len];
+
         let stt_config = parakeet_rs::ExecutionConfig {
             execution_provider: parakeet_rs::ExecutionProvider::Cuda,
             ..Default::default()
@@ -103,8 +130,13 @@ impl Stt {
         let mut stt_model = ParakeetTDT::from_pretrained(model_path, Some(stt_config))
             .context("failed to load TDT STT model")?;
 
-        let total_frames = (samples.len() / channels as usize) as i64;
-        let total_ms = (total_frames * 1000) / sample_rate as i64;
+        let sample_count =
+            i64::try_from(samples.len()).context("audio sample count is too large")?;
+        let total_frames = sample_count / i64::from(channels);
+        let total_ms = total_frames
+            .checked_mul(1000)
+            .and_then(|v| v.checked_div(i64::from(sample_rate)))
+            .context("failed to compute total audio duration")?;
 
         let windows = build_vad_windows(vad_segments, total_ms, opts);
 
@@ -118,14 +150,26 @@ impl Stt {
                 continue;
             }
 
-            let r = stt_model
-                .transcribe_samples(
+            let transcribe_result = panic::catch_unwind(AssertUnwindSafe(|| {
+                stt_model.transcribe_samples(
                     chunk.to_vec(),
                     sample_rate,
                     channels as u16,
                     Some(opts.timestamp_mode),
                 )
-                .context("TDT transcription failed")?;
+            }));
+
+            let r = match transcribe_result {
+                Ok(inner) => inner.context("TDT transcription failed")?,
+                Err(panic_payload) => {
+                    anyhow::bail!(
+                        "TDT transcription panicked for window {}-{} ms: {}. Verify sample_rate/channels and audio length.",
+                        w.start_ms,
+                        w.end_ms,
+                        panic_payload_to_string(panic_payload)
+                    )
+                }
+            };
 
             for t in r.tokens {
                 out.push(SttSegment {
@@ -309,6 +353,16 @@ impl Stt {
     }
 }
 
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "unknown panic payload".to_string()
+}
+
 #[derive(Debug, Clone, Copy)]
 struct VadWindow {
     start_ms: i64,
@@ -320,6 +374,8 @@ fn build_vad_windows(
     total_ms: i64,
     opts: &SttOptions,
 ) -> Vec<VadWindow> {
+    let max_window_ms = opts.max_window_ms.max(1);
+
     let mut segs: Vec<VadWindow> = vad_segments
         .iter()
         .copied()
@@ -348,7 +404,7 @@ fn build_vad_windows(
     for s in merged {
         let mut cur_start = s.start_ms;
         while cur_start < s.end_ms {
-            let cur_end = (cur_start + opts.max_window_ms).min(s.end_ms);
+            let cur_end = (cur_start + max_window_ms).min(s.end_ms);
             out.push(VadWindow {
                 start_ms: cur_start,
                 end_ms: cur_end,
@@ -370,20 +426,48 @@ fn slice_by_ms(
     let sr = sample_rate as i64;
     let ch = channels as i64;
 
-    let start_frames = (start_ms * sr) / 1000;
-    let end_frames = (end_ms * sr) / 1000;
+    let start_frames = start_ms.saturating_mul(sr) / 1000;
+    let end_frames = end_ms.saturating_mul(sr) / 1000;
 
-    let start_idx = (start_frames * ch).max(0) as usize;
-    let end_idx = (end_frames * ch).max(0) as usize;
+    let start_idx_i64 = start_frames.saturating_mul(ch).max(0);
+    let end_idx_i64 = end_frames.saturating_mul(ch).max(0);
+
+    let start_idx = usize::try_from(start_idx_i64).unwrap_or(usize::MAX);
+    let end_idx = usize::try_from(end_idx_i64).unwrap_or(usize::MAX);
 
     let start_idx = start_idx.min(samples.len());
     let end_idx = end_idx.min(samples.len());
+
+    let frame_width = channels as usize;
+    let start_idx = align_up_to_frame(start_idx, frame_width).min(samples.len());
+    let end_idx = align_down_to_frame(end_idx, frame_width);
 
     if end_idx <= start_idx {
         return (&[], start_ms);
     }
 
     (&samples[start_idx..end_idx], start_ms)
+}
+
+fn align_up_to_frame(idx: usize, frame_width: usize) -> usize {
+    if frame_width <= 1 {
+        return idx;
+    }
+
+    let rem = idx % frame_width;
+    if rem == 0 {
+        idx
+    } else {
+        idx.saturating_add(frame_width - rem)
+    }
+}
+
+fn align_down_to_frame(idx: usize, frame_width: usize) -> usize {
+    if frame_width <= 1 {
+        return idx;
+    }
+
+    idx - (idx % frame_width)
 }
 
 fn merge_sentence_fragments_impl(

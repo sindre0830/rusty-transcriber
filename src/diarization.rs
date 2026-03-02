@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -43,6 +44,20 @@ impl Diarization {
         channels: u8,
         model_path: &Path,
     ) -> Result<Self> {
+        if sample_rate == 0 {
+            anyhow::bail!("sample_rate must be > 0");
+        }
+        if channels == 0 {
+            anyhow::bail!("channels must be > 0");
+        }
+        if !samples.len().is_multiple_of(channels as usize) {
+            anyhow::bail!(
+                "samples length ({}) must be divisible by channels ({})",
+                samples.len(),
+                channels
+            );
+        }
+
         let diar_config = parakeet_rs::ExecutionConfig {
             execution_provider: parakeet_rs::ExecutionProvider::Cuda,
             ..Default::default()
@@ -54,9 +69,19 @@ impl Diarization {
         )
         .context("failed to load sortformer diarization model")?;
 
-        let segments = diarizer
-            .diarize(samples.to_vec(), sample_rate, channels as u16)
-            .context("sortformer diarization failed")?;
+        let diarize_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            diarizer.diarize(samples.to_vec(), sample_rate, channels as u16)
+        }));
+
+        let segments = match diarize_result {
+            Ok(inner) => inner.context("sortformer diarization failed")?,
+            Err(panic_payload) => {
+                anyhow::bail!(
+                    "sortformer diarization panicked: {}. Verify sample_rate/channels and reduce input audio length.",
+                    panic_payload_to_string(panic_payload)
+                )
+            }
+        };
 
         let mut out = Self {
             segments: segments
@@ -319,4 +344,14 @@ impl Diarization {
             self.segments.sort_by_key(|s| s.start_ms);
         }
     }
+}
+
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "unknown panic payload".to_string()
 }
